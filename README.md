@@ -24,6 +24,15 @@ Rust tool:
 cargo test
 ```
 
+Rust tool release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+This triggers the GitHub Actions release workflow for `harmony-midi` only and uploads Linux, macOS, and Windows CLI archives to the GitHub Release.
+
 Web app:
 
 ```bash

@@ -1,0 +1,126 @@
+name: Release Rust Tool
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: harmony-midi
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+  build-release:
+    name: Build ${{ matrix.target }}
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCHIVE_NAME: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.archive_ext }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_path: target/x86_64-unknown-linux-gnu/release/harmony-midi
+            artifact_name: harmony-midi-x86_64-unknown-linux-gnu
+            archive_kind: tar.gz
+            archive_ext: .tar.gz
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            binary_path: target/aarch64-apple-darwin/release/harmony-midi
+            artifact_name: harmony-midi-aarch64-apple-darwin
+            archive_kind: tar.gz
+            archive_ext: .tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_path: target/x86_64-pc-windows-msvc/release/harmony-midi.exe
+            artifact_name: harmony-midi-x86_64-pc-windows-msvc
+            archive_kind: zip
+            archive_ext: .zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin "${BINARY_NAME}" --target "${{ matrix.target }}"
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          rm -rf release-package
+          mkdir -p "release-package/${BINARY_NAME}"
+          cp "${{ matrix.binary_path }}" "release-package/${BINARY_NAME}/"
+          cp README.md LICENSE "release-package/${BINARY_NAME}/"
+
+      - name: Create tarball
+        if: matrix.archive_kind == 'tar.gz'
+        shell: bash
+        run: |
+          tar -C release-package -czf "${ARCHIVE_NAME}" "${BINARY_NAME}"
+
+      - name: Create zip archive
+        if: matrix.archive_kind == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "release-package/${env:BINARY_NAME}" -DestinationPath "${env:ARCHIVE_NAME}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ env.ARCHIVE_NAME }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish release
+    needs: build-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-artifacts/*/*
