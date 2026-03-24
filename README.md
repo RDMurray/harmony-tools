@@ -16,7 +16,27 @@ This repository does not include any firmware ROM dumps.
 - For the web app, place your own ROM dumps in `web/roms/` locally before building, or use the upload control in the browser.
 - For CLI workflows, pass your own firmware/code files to the Rust tool commands.
 
-## Build
+## Usage
+
+Download prebuilt `harmony-midi` binaries from the [latest release](https://github.com/RDMurray/harmony-tools/releases/latest).
+
+If you are running from source, use `cargo run -- <command>` in place of `harmony-midi <command>`.
+
+```bash
+harmony-midi extract-firmware M27C256B.BIN extracted/
+harmony-midi harmony-to-midi extracted/code.bin extracted/song01.bin song01.mid
+harmony-midi midi-to-harmony extracted/code.bin song01.mid song01.bin
+harmony-midi build-firmware extracted/ rebuilt.bin
+```
+
+For full command help:
+
+```bash
+harmony-midi --help
+harmony-midi <command> --help
+```
+
+## Build And Development
 
 Rust tool:
 

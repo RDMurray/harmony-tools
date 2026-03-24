@@ -36,6 +36,30 @@ header p {
   color: var(--muted);
 }
 
+.github-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid #3b5164;
+  border-radius: 999px;
+  background: rgba(15, 22, 28, 0.85);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.github-link:hover,
+.github-link:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.app-footer {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 20px;
+}
+
 .panel {
   background: linear-gradient(170deg, var(--surface), var(--surface-2));
   border: 1px solid #2e404f;
