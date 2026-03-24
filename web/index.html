@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Harmony32 Web</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>Harmony32</h1>
+      <p>Realtime YM2149 playback in-browser.</p>
+    </header>
+
+    <section class="panel">
+      <div class="media-controls" role="group" aria-label="Playback controls">
+        <button id="songPrevBtn" type="button" aria-label="Previous song">Prev</button>
+        <button id="playPauseBtn" type="button" aria-label="Play">Play</button>
+        <button id="songNextBtn" type="button" aria-label="Next song">Next</button>
+      </div>
+      <span id="audioState" aria-live="polite">idle</span>
+    </section>
+
+    <section class="panel grid">
+      <div>
+        <span class="control-label">Song</span>
+        <div class="button-row">
+          <span id="songValue" class="value-chip">1</span>
+        </div>
+      </div>
+      <div>
+        <span class="control-label">Bank</span>
+        <div class="button-row">
+          <button id="bankPrevBtn" type="button" aria-label="Previous bank">Prev</button>
+          <span id="bankValue" class="value-chip">1/1</span>
+          <button id="bankNextBtn" type="button" aria-label="Next bank">Next</button>
+        </div>
+      </div>
+      <div>
+        <span class="control-label">Speed</span>
+        <div class="button-row">
+          <button id="speed1Btn" type="button" class="toggle-btn">1</button>
+          <button id="speed2Btn" type="button" class="toggle-btn active">2</button>
+          <button id="speed3Btn" type="button" class="toggle-btn">3</button>
+          <button id="speed4Btn" type="button" class="toggle-btn">4</button>
+        </div>
+      </div>
+      <label class="switch-row" for="drumsSwitch">Drums
+        <input id="drumsSwitch" type="checkbox" checked aria-label="Toggle drums on or off" />
+      </label>
+    </section>
+
+    <section class="panel">
+      <span class="control-label">Render Mode</span>
+      <div class="button-row">
+        <button id="mixLegacyBtn" type="button" class="toggle-btn">Legacy C Mix</button>
+        <button id="mixStemBtn" type="button" class="toggle-btn active">Stem FX Mix</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="button-row">
+        <button id="cpuResetBtn" type="button">CPU Reset</button>
+        <button id="fullResetBtn" type="button">Full Reset</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Channel Mix</h2>
+      <div class="channel-grid">
+        <div class="channel-row">
+          <strong>Channel A</strong>
+          <label for="chALevel">Level <span id="chALevelValue" class="value-chip">100%</span></label>
+          <input id="chALevel" type="range" min="0" max="400" step="1" value="100" />
+          <label for="chADrive">Drive <span id="chADriveValue" class="value-chip">0%</span></label>
+          <input id="chADrive" type="range" min="0" max="100" step="1" value="0" />
+          <label for="chAPan">Pan <span id="chAPanValue" class="value-chip">0</span></label>
+          <input id="chAPan" type="range" min="-100" max="100" step="1" value="0" />
+        </div>
+        <div class="channel-row">
+          <strong>Channel B</strong>
+          <label for="chBLevel">Level <span id="chBLevelValue" class="value-chip">100%</span></label>
+          <input id="chBLevel" type="range" min="0" max="400" step="1" value="100" />
+          <label for="chBDrive">Drive <span id="chBDriveValue" class="value-chip">0%</span></label>
+          <input id="chBDrive" type="range" min="0" max="100" step="1" value="0" />
+          <label for="chBPan">Pan <span id="chBPanValue" class="value-chip">0</span></label>
+          <input id="chBPan" type="range" min="-100" max="100" step="1" value="0" />
+        </div>
+        <div class="channel-row">
+          <strong>Channel C</strong>
+          <label for="chCLevel">Level <span id="chCLevelValue" class="value-chip">100%</span></label>
+          <input id="chCLevel" type="range" min="0" max="400" step="1" value="100" />
+          <label for="chCDrive">Drive <span id="chCDriveValue" class="value-chip">0%</span></label>
+          <input id="chCDrive" type="range" min="0" max="100" step="1" value="0" />
+          <label for="chCPan">Pan <span id="chCPanValue" class="value-chip">0</span></label>
+          <input id="chCPan" type="range" min="-100" max="100" step="1" value="0" />
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Master FX</h2>
+      <div class="channel-grid">
+        <div class="channel-row">
+          <label class="switch-row" for="irEnable">IR Enabled
+            <input id="irEnable" type="checkbox" aria-label="Enable impulse response" />
+          </label>
+          <label for="irMix">IR Wet <span id="irMixValue" class="value-chip">0%</span></label>
+          <input id="irMix" type="range" min="0" max="100" step="1" value="0" />
+          <label>
+            Bundled IR
+            <select id="irSelect" aria-label="Select bundled impulse response"></select>
+          </label>
+          <label class="file">
+            Upload IR
+            <input id="irUpload" type="file" accept="audio/*,.wav,.aiff,.aif,.mp3,.ogg" />
+          </label>
+        </div>
+        <div class="channel-row">
+          <label for="compAmount">Compressor <span id="compAmountValue" class="value-chip">0%</span></label>
+          <input id="compAmount" type="range" min="0" max="100" step="1" value="0" />
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <label>
+        Bundled ROM
+        <select id="romSelect" aria-label="Select local ROM bundle"></select>
+      </label>
+      <label class="file">
+        Upload ROM override
+        <input id="romUpload" type="file" accept=".bin,application/octet-stream" />
+      </label>
+      <small id="romInfo">No ROM loaded. Upload your own dump or add local files under <code>web/roms/</code>.</small>
+    </section>
+
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

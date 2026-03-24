@@ -1,0 +1,22 @@
+# Cloudflare/Wrangler local state
+.wrangler/
+web/.dev.vars
+
+# Web build output
+web/dist/
+web/roms/
+
+# Native build artifacts
+target/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+ym2149_basic_wav
+
+# Generated audio artifacts
+*.wav
+wav_*/
+!web/irs/
+!web/irs/*.wav
