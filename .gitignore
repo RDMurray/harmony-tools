@@ -1,6 +1,5 @@
 # Cloudflare/Wrangler local state
 .wrangler/
-web/.dev.vars
 
 # Web build output
 web/dist/

@@ -1,6 +1,6 @@
 # Harmony32
 
-Reverse-engineering, playback, and conversion tools for a Harmony32/Harmony64 YM2149-based music system.
+Reverse-engineering, playback, and conversion tools for the Microminiatures Harmony 32 / Harmony 64 chime boxes and their YM2149-based music system.
 
 ## What Is Here
 
