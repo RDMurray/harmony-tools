@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  BINARY_NAME: harmony-midi
-
 jobs:
   check:
     name: Check
@@ -34,10 +30,8 @@ jobs:
   build-release:
     name: Build ${{ matrix.target }}
     needs: check
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref_type == 'tag'
     runs-on: ${{ matrix.runner }}
-    env:
-      ARCHIVE_NAME: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.archive_ext }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,19 +40,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_path: target/x86_64-unknown-linux-gnu/release/harmony-midi
             artifact_name: harmony-midi-x86_64-unknown-linux-gnu
-            archive_kind: tar.gz
             archive_ext: .tar.gz
           - runner: macos-14
             target: aarch64-apple-darwin
             binary_path: target/aarch64-apple-darwin/release/harmony-midi
             artifact_name: harmony-midi-aarch64-apple-darwin
-            archive_kind: tar.gz
             archive_ext: .tar.gz
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             binary_path: target/x86_64-pc-windows-msvc/release/harmony-midi.exe
             artifact_name: harmony-midi-x86_64-pc-windows-msvc
-            archive_kind: zip
             archive_ext: .zip
 
     steps:
@@ -76,27 +67,31 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked --bin "${BINARY_NAME}" --target "${{ matrix.target }}"
+        run: cargo build --release --locked --bin harmony-midi --target "${{ matrix.target }}"
 
       - name: Stage release files
         shell: bash
         run: |
           rm -rf release-package
-          mkdir -p "release-package/${BINARY_NAME}"
-          cp "${{ matrix.binary_path }}" "release-package/${BINARY_NAME}/"
-          cp README.md LICENSE "release-package/${BINARY_NAME}/"
+          mkdir -p release-package/harmony-midi
+          cp "${{ matrix.binary_path }}" release-package/harmony-midi/
+          cp README.md LICENSE release-package/harmony-midi/
 
       - name: Create tarball
-        if: matrix.archive_kind == 'tar.gz'
+        if: matrix.archive_ext == '.tar.gz'
         shell: bash
         run: |
-          tar -C release-package -czf "${ARCHIVE_NAME}" "${BINARY_NAME}"
+          archive_name="harmony-midi-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar -C release-package -czf "${archive_name}" harmony-midi
+          echo "ARCHIVE_NAME=${archive_name}" >> "${GITHUB_ENV}"
 
       - name: Create zip archive
-        if: matrix.archive_kind == 'zip'
+        if: matrix.archive_ext == '.zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path "release-package/${env:BINARY_NAME}" -DestinationPath "${env:ARCHIVE_NAME}"
+          $archiveName = "harmony-midi-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          Compress-Archive -Path "release-package/harmony-midi" -DestinationPath $archiveName
+          "ARCHIVE_NAME=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
@@ -108,7 +103,7 @@ jobs:
   publish-release:
     name: Publish release
     needs: build-release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -120,7 +115,6 @@ jobs:
           path: release-artifacts
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: release-artifacts/*/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" release-artifacts/*/* --generate-notes --verify-tag
