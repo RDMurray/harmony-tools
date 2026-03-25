@@ -99,6 +99,41 @@ static void envelope_set_shape(YM2149Core *ym, uint8_t shape, uint8_t mask) {
     ym->envelope.volume = (uint32_t)(ym->envelope.step ^ ym->envelope.attack);
 }
 
+static double ym2149_mix_current_output(const YM2149Core *ym, double out_channels[3]) {
+    double mix = 0.0;
+
+    for (int chan = 0; chan < 3; chan++) {
+        uint8_t vol = ym->tone[chan].volume;
+        double s;
+
+        if (vol & 0x10) {
+            uint8_t idx = (uint8_t)(ym->vol_enabled[chan] ? (ym->envelope.volume & 0x1F) : 0u);
+            s = ym->env_table[idx];
+        } else {
+            uint8_t idx = (uint8_t)(ym->vol_enabled[chan] ? (vol & 0x0F) : 0u);
+            s = ym->vol_table[idx];
+        }
+
+        if (out_channels) {
+            out_channels[chan] = s;
+        }
+        mix += s;
+    }
+
+    return mix;
+}
+
+static void ym2149_seed_resampler(YM2149Core *ym) {
+    ym->resample_phase = 0.0;
+    ym->resample_curr_output = ym2149_mix_current_output(ym, ym->resample_curr_channels);
+    ym->resample_prev_output = ym->resample_curr_output;
+    for (int chan = 0; chan < 3; chan++) {
+        ym->resample_prev_channels[chan] = ym->resample_curr_channels[chan];
+    }
+    ym->last_output = ym->resample_curr_output;
+    ym->resample_seeded = 1;
+}
+
 static void ym2149_write_reg(YM2149Core *ym, int reg, uint8_t value) {
     uint8_t coarse;
 
@@ -151,6 +186,7 @@ void ym2149_init(YM2149Core *ym, uint32_t clock_hz, uint32_t sample_rate) {
     ym->chip_clock_hz = clock_hz;
     ym->output_sample_rate = sample_rate;
     ym->chip_sample_rate = (clock_hz > 7) ? (clock_hz / 8u) : 1u;
+    ym->render_mode = YM2149_RENDER_RESAMPLED;
 
     build_single_table(1000.0, &ym2149_param, 1, ym->vol_table, 0);
     build_single_table(1000.0, &ym2149_param_env, 1, ym->env_table, 0);
@@ -167,6 +203,17 @@ void ym2149_set_clock(YM2149Core *ym, uint32_t clock_hz) {
     ym->chip_sample_rate = (clock_hz > 7) ? (clock_hz / 8u) : 1u;
 }
 
+void ym2149_set_render_mode(YM2149Core *ym, uint8_t mode) {
+    if (!ym) {
+        return;
+    }
+
+    ym->render_mode = (mode == YM2149_RENDER_DIRECT) ? YM2149_RENDER_DIRECT : YM2149_RENDER_RESAMPLED;
+    ym->step_accum = 0;
+    ym->resample_seeded = 0;
+    ym2149_seed_resampler(ym);
+}
+
 void ym2149_reset(YM2149Core *ym) {
     ym->active = 0;
     ym->selected_reg = 0;
@@ -174,16 +221,24 @@ void ym2149_reset(YM2149Core *ym) {
     ym->count_noise = 0;
     ym->prescale_noise = 0;
     ym->step_accum = 0;
+    ym->resample_phase = 0.0;
+    ym->resample_seeded = 0;
+    ym->resample_prev_output = 0.0;
+    ym->resample_curr_output = 0.0;
     ym->last_output = 0.0;
 
     memset(ym->regs, 0, sizeof(ym->regs));
     memset(ym->vol_enabled, 0, sizeof(ym->vol_enabled));
     memset(ym->tone, 0, sizeof(ym->tone));
     memset(&ym->envelope, 0, sizeof(ym->envelope));
+    memset(ym->resample_prev_channels, 0, sizeof(ym->resample_prev_channels));
+    memset(ym->resample_curr_channels, 0, sizeof(ym->resample_curr_channels));
 
     for (int i = 0; i < AY_PORTA; i++) {
         ym2149_write_reg(ym, i, 0);
     }
+
+    ym2149_seed_resampler(ym);
 }
 
 void ym2149_write_address(YM2149Core *ym, uint8_t reg) {
@@ -252,30 +307,17 @@ static double ym2149_step_chip_sample(YM2149Core *ym, double out_channels[3]) {
     }
     ym->envelope.volume = (uint32_t)(ym->envelope.step ^ ym->envelope.attack);
 
-    {
-        double mix = 0.0;
-        for (int chan = 0; chan < 3; chan++) {
-            uint8_t vol = ym->tone[chan].volume;
-            double s;
-            if (vol & 0x10) {
-                uint8_t idx = (uint8_t)(ym->vol_enabled[chan] ? (ym->envelope.volume & 0x1F) : 0u);
-                s = ym->env_table[idx];
-            } else {
-                uint8_t idx = (uint8_t)(ym->vol_enabled[chan] ? (vol & 0x0F) : 0u);
-                s = ym->vol_table[idx];
-            }
-            if (out_channels) {
-                out_channels[chan] = s;
-            }
-            mix += s;
-        }
-        ym->last_output = mix;
-    }
+    ym->last_output = ym2149_mix_current_output(ym, out_channels);
 
     return ym->last_output;
 }
 
 double ym2149_next_sample(YM2149Core *ym) {
+    if (ym->render_mode == YM2149_RENDER_RESAMPLED) {
+        double channels[3];
+        return ym2149_next_sample_channels(ym, channels);
+    }
+
     ym->step_accum += ym->chip_sample_rate;
     while (ym->step_accum >= ym->output_sample_rate) {
         ym->step_accum -= ym->output_sample_rate;
@@ -292,6 +334,35 @@ double ym2149_next_sample(YM2149Core *ym) {
 }
 
 double ym2149_next_sample_channels(YM2149Core *ym, double out_channels[3]) {
+    if (ym->render_mode == YM2149_RENDER_RESAMPLED) {
+        if (!ym->resample_seeded) {
+            ym2149_seed_resampler(ym);
+        }
+
+        ym->resample_phase += (double)ym->chip_sample_rate / (double)ym->output_sample_rate;
+        while (ym->resample_phase >= 1.0) {
+            ym->resample_phase -= 1.0;
+            ym->resample_prev_output = ym->resample_curr_output;
+            for (int chan = 0; chan < 3; chan++) {
+                ym->resample_prev_channels[chan] = ym->resample_curr_channels[chan];
+            }
+            ym->resample_curr_output = ym2149_step_chip_sample(ym, ym->resample_curr_channels);
+        }
+
+        if (out_channels) {
+            for (int chan = 0; chan < 3; chan++) {
+                out_channels[chan] =
+                    ym->resample_prev_channels[chan] +
+                    ((ym->resample_curr_channels[chan] - ym->resample_prev_channels[chan]) * ym->resample_phase);
+            }
+        }
+
+        ym->last_output =
+            ym->resample_prev_output +
+            ((ym->resample_curr_output - ym->resample_prev_output) * ym->resample_phase);
+        return ym->last_output;
+    }
+
     if (out_channels) {
         out_channels[0] = 0.0;
         out_channels[1] = 0.0;

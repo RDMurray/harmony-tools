@@ -17,6 +17,8 @@ const els = {
   ymFreqInput: document.getElementById("ymFreqInput"),
   mixLegacyBtn: document.getElementById("mixLegacyBtn"),
   mixStemBtn: document.getElementById("mixStemBtn"),
+  ymResampledBtn: document.getElementById("ymResampledBtn"),
+  ymDirectBtn: document.getElementById("ymDirectBtn"),
 
   chALevel: document.getElementById("chALevel"),
   chBLevel: document.getElementById("chBLevel"),
@@ -69,7 +71,8 @@ const CONTROL_IDX = {
   chCDrive: 14,
   mixMode: 15,
   cpuHz: 16,
-  ymHz: 17
+  ymHz: 17,
+  ymRenderMode: 18
 };
 
 const DEFAULT_CPU_HZ = 2000000;
@@ -100,6 +103,7 @@ let currentSpeedUi = 2;
 let currentMixMode = 1;
 let currentCpuHzUi = DEFAULT_CPU_HZ;
 let currentYmHzUi = DEFAULT_YM_HZ;
+let currentYmRenderMode = 1;
 
 function setPlayEnabled(enabled) {
   if (els.playPauseBtn) {
@@ -236,7 +240,8 @@ function readControls(runningOverride) {
     chCDrive,
     mixMode: currentMixMode,
     cpuHz: readCpuHzFromUi(),
-    ymHz: readYmHzFromUi()
+    ymHz: readYmHzFromUi(),
+    ymRenderMode: currentYmRenderMode
   };
 }
 
@@ -286,6 +291,12 @@ function renderControlState() {
   }
   if (els.mixStemBtn) {
     els.mixStemBtn.classList.toggle("active", currentMixMode === 1);
+  }
+  if (els.ymResampledBtn) {
+    els.ymResampledBtn.classList.toggle("active", currentYmRenderMode === 1);
+  }
+  if (els.ymDirectBtn) {
+    els.ymDirectBtn.classList.toggle("active", currentYmRenderMode === 0);
   }
 
   if (els.chALevelValue && els.chALevel) {
@@ -347,6 +358,7 @@ function writeControlBlock(values, markDirty = true) {
   Atomics.store(control, CONTROL_IDX.mixMode, values.mixMode);
   Atomics.store(controlU32, CONTROL_IDX.cpuHz, values.cpuHz >>> 0);
   Atomics.store(controlU32, CONTROL_IDX.ymHz, values.ymHz >>> 0);
+  Atomics.store(control, CONTROL_IDX.ymRenderMode, values.ymRenderMode);
   if (markDirty) {
     Atomics.store(control, CONTROL_IDX.dirty, 1);
   }
@@ -580,6 +592,10 @@ async function ensureAudio() {
         currentMixMode = msg.status.mixMode === 0 ? 0 : 1;
         renderControlState();
       }
+      if (typeof msg.status.ymRenderMode === "number" && msg.status.ymRenderMode !== currentYmRenderMode) {
+        currentYmRenderMode = msg.status.ymRenderMode === 0 ? 0 : 1;
+        renderControlState();
+      }
       if (typeof msg.status.cpuHz === "number" && msg.status.cpuHz > 0 && document.activeElement !== els.cpuFreqInput) {
         syncCpuInputFromHz(msg.status.cpuHz);
       }
@@ -794,6 +810,14 @@ function wireEvents() {
   });
   els.mixStemBtn.addEventListener("click", () => {
     currentMixMode = 1;
+    instantApply();
+  });
+  els.ymResampledBtn.addEventListener("click", () => {
+    currentYmRenderMode = 1;
+    instantApply();
+  });
+  els.ymDirectBtn.addEventListener("click", () => {
+    currentYmRenderMode = 0;
     instantApply();
   });
 

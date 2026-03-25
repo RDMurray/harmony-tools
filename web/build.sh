@@ -29,7 +29,7 @@ emcc \
   -s EXPORT_ES6=1 \
   -s ENVIRONMENT='web,worker' \
   -s ALLOW_MEMORY_GROWTH=1 \
-  -s EXPORTED_FUNCTIONS='["_malloc","_free","_h32_create","_h32_destroy","_h32_load_rom","_h32_set_controls","_h32_set_cpu_hz","_h32_set_ym_hz","_h32_set_channel_mix","_h32_set_mix_mode","_h32_reset_song","_h32_reset_cpu","_h32_reset_full","_h32_get_bank_count","_h32_render","_h32_render_stems","_h32_get_status"]' \
+  -s EXPORTED_FUNCTIONS='["_malloc","_free","_h32_create","_h32_destroy","_h32_load_rom","_h32_set_controls","_h32_set_cpu_hz","_h32_set_ym_hz","_h32_set_ym_render_mode","_h32_set_channel_mix","_h32_set_mix_mode","_h32_reset_song","_h32_reset_cpu","_h32_reset_full","_h32_get_bank_count","_h32_render","_h32_render_stems","_h32_get_status"]' \
   -s EXPORTED_RUNTIME_METHODS='["HEAPU8","HEAPU32","HEAPF32"]' \
   -o "${DIST_DIR}/harmony32_wasm.js"
 

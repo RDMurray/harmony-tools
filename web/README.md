@@ -40,6 +40,7 @@ These are required for `SharedArrayBuffer` in current browsers including recent 
 - Drums: `on/off`
 - CPU clock: MHz input, decimal values allowed (`2.31` => `2310000 Hz`), default `2.0`
 - YM clock: separate MHz input, decimal values allowed, default `2.0`
+- YM output: `Resampled` (default) or `Direct` fallback
 - Render mode: `Legacy C Mix` or `Stem FX Mix`
 - Channel level (A/B/C): `0..400%` (for over-unity drive in stem mode)
 - Channel drive (A/B/C): `0..100%` (waveshaper saturation in stem mode)
@@ -49,7 +50,7 @@ These are required for `SharedArrayBuffer` in current browsers including recent 
 - `CPU Reset`: reset only Z80 state (RAM/YM preserved; useful for glitch experiments)
 - `Full Reset`: reinitialize current song/bank with board reset (recovery path)
 
-Song/bank/speed/drums/CPU clock/YM clock/mix/channel settings apply immediately (next audio quantum).
+Song/bank/speed/drums/CPU clock/YM clock/YM output/mix/channel settings apply immediately (next audio quantum).
 
 ## ROM source
 

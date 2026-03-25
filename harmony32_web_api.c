@@ -239,6 +239,19 @@ H32_KEEPALIVE int h32_set_ym_hz(H32Engine *engine, uint32_t ym_hz) {
     return 0;
 }
 
+H32_KEEPALIVE int h32_set_ym_render_mode(H32Engine *engine, uint8_t render_mode) {
+    if (!engine || render_mode > YM2149_RENDER_RESAMPLED) {
+        return -1;
+    }
+
+    if (engine->ym.render_mode == render_mode) {
+        return 0;
+    }
+
+    ym2149_set_render_mode(&engine->ym, render_mode);
+    return 0;
+}
+
 H32_KEEPALIVE int h32_set_channel_mix(H32Engine *engine, uint8_t channel, int32_t level_pct, int32_t pan_pct) {
     if (!engine || channel > 2 || level_pct < 0 || level_pct > 100 || pan_pct < -100 || pan_pct > 100) {
         return -1;
@@ -398,6 +411,7 @@ H32_KEEPALIVE int h32_get_status(const H32Engine *engine, H32Status *out_status)
     out_status->song_ended = engine->song_ended;
     out_status->initialized = engine->initialized;
     out_status->running = engine->running;
+    out_status->ym_render_mode = engine->ym.render_mode;
     out_status->song = engine->song;
     out_status->mix_mode = engine->mix_mode;
     out_status->bank = engine->bank;

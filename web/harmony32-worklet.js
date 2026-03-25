@@ -122,6 +122,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
     let mixMode = 1;
     let cpuHz = this.cpuHz;
     let ymHz = this.ymHz;
+    let ymRenderMode = 1;
 
     if (this.ctrl) {
       song = Atomics.load(this.ctrl, 1);
@@ -140,6 +141,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
         cpuHz = Atomics.load(this.ctrlU32, 16) >>> 0;
         ymHz = Atomics.load(this.ctrlU32, 17) >>> 0;
       }
+      ymRenderMode = Atomics.load(this.ctrl, 18);
       if (!forceReset) {
         Atomics.store(this.ctrl, 0, 0);
       }
@@ -154,6 +156,9 @@ class Harmony32Processor extends AudioWorkletProcessor {
     if (!Number.isFinite(ymHz) || ymHz <= 0) {
       ymHz = 2000000;
     }
+    if (ymRenderMode !== 0) {
+      ymRenderMode = 1;
+    }
     this.cpuHz = cpuHz;
     this.ymHz = ymHz;
 
@@ -162,6 +167,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
     }
     this.mod._h32_set_cpu_hz(this.engine, cpuHz >>> 0);
     this.mod._h32_set_ym_hz(this.engine, ymHz >>> 0);
+    this.mod._h32_set_ym_render_mode(this.engine, ymRenderMode);
     this.mod._h32_set_controls(this.engine, song, bank >>> 0, speed, drumsOn, running);
     this.mod._h32_set_mix_mode(this.engine, mixMode);
 
@@ -222,6 +228,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
       songEnded: h[baseU8],
       initialized: h[baseU8 + 1],
       running: h[baseU8 + 2],
+      ymRenderMode: h[baseU8 + 3],
       song: h[baseU8 + 4],
       speed: h[baseU8 + 5],
       drumsOn: h[baseU8 + 6],

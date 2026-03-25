@@ -13,7 +13,7 @@ typedef struct {
     uint8_t song_ended;
     uint8_t initialized;
     uint8_t running;
-    uint8_t reserved;
+    uint8_t ym_render_mode;
     uint8_t song;
     uint8_t speed;
     uint8_t drums_on;
@@ -33,6 +33,7 @@ int h32_load_rom(H32Engine *engine, const uint8_t *rom, uint32_t rom_len);
 int h32_set_controls(H32Engine *engine, uint8_t song, uint32_t bank, uint8_t speed, uint8_t drums_on, uint8_t running);
 int h32_set_cpu_hz(H32Engine *engine, uint32_t cpu_hz);
 int h32_set_ym_hz(H32Engine *engine, uint32_t ym_hz);
+int h32_set_ym_render_mode(H32Engine *engine, uint8_t render_mode);
 int h32_set_channel_mix(H32Engine *engine, uint8_t channel, int32_t level_pct, int32_t pan_pct);
 int h32_set_mix_mode(H32Engine *engine, uint8_t mix_mode);
 int h32_reset_song(H32Engine *engine, uint8_t song, uint32_t bank);
