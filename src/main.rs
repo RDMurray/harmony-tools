@@ -15,24 +15,26 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    ExtractFirmware {
+    Extract {
         firmware: PathBuf,
         output_dir: PathBuf,
     },
-    BuildFirmware {
-        #[arg(long, value_delimiter = ',', num_args = 3, value_parser = clap::value_parser!(u8).range(0..=15))]
+    Build {
+        #[arg(short = 'c', long, value_delimiter = ',', num_args = 3, value_parser = clap::value_parser!(u8).range(0..=15))]
         channel_volumes: Option<Vec<u8>>,
-        #[arg(long, default_value_t = harmony_midi::HARMONY_TICKS_PER_QUARTER, value_parser = clap::value_parser!(u16).range(1..))]
+        #[arg(short = 't', long, default_value_t = harmony_midi::HARMONY_TICKS_PER_QUARTER, value_parser = clap::value_parser!(u16).range(1..))]
         ticks_per_quarter: u16,
         input_dir: PathBuf,
         output_firmware: PathBuf,
     },
-    HarmonyToMidi {
+    ToMidi {
         code_bin: PathBuf,
         song_bin: PathBuf,
         output_midi: PathBuf,
     },
-    MidiToHarmony {
+    ToHarmony {
+        #[arg(short = 't', long, default_value_t = harmony_midi::HARMONY_TICKS_PER_QUARTER, value_parser = clap::value_parser!(u16).range(1..))]
+        ticks_per_quarter: u16,
         code_bin: PathBuf,
         input_midi: PathBuf,
         output_song: PathBuf,
@@ -43,11 +45,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let verbose = cli.verbose;
     match cli.command {
-        Command::ExtractFirmware {
+        Command::Extract {
             firmware,
             output_dir,
         } => harmony_midi::extract_firmware_to_dir(&firmware, &output_dir),
-        Command::BuildFirmware {
+        Command::Build {
             channel_volumes,
             ticks_per_quarter,
             input_dir,
@@ -74,7 +76,7 @@ fn main() -> Result<()> {
             );
             println!("code section per bank: {} bytes", report.code_section_bytes);
             println!(
-                "MIDI import quantisation: {} harmony ticks per quarter note",
+                "MIDI import baseline: {} harmony ticks per quarter note at 120 BPM",
                 ticks_per_quarter
             );
             for bank in &report.banks {
@@ -94,18 +96,23 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::HarmonyToMidi {
+        Command::ToMidi {
             code_bin,
             song_bin,
             output_midi,
         } => harmony_midi::harmony_song_to_midi_file(&code_bin, &song_bin, &output_midi),
-        Command::MidiToHarmony {
+        Command::ToHarmony {
+            ticks_per_quarter,
             code_bin,
             input_midi,
             output_song,
         } => {
-            let warnings =
-                harmony_midi::midi_song_to_harmony_file(&code_bin, &input_midi, &output_song)?;
+            let warnings = harmony_midi::midi_song_to_harmony_file_with_ticks(
+                &code_bin,
+                &input_midi,
+                &output_song,
+                ticks_per_quarter,
+            )?;
             for warning in render_warnings(warnings, verbose) {
                 eprintln!("warning: {warning}");
             }
@@ -238,5 +245,48 @@ mod tests {
 
         let rendered = render_warnings(warnings, false);
         assert!(rendered.iter().any(|line| line == "bank 02 song 08: 2 overlapping notes were dropped on MIDI channel 3 because a later note took precedence after quantisation"));
+    }
+
+    #[test]
+    fn parses_short_command_names_and_flags() {
+        let cli = Cli::try_parse_from([
+            "harmony-midi",
+            "-v",
+            "build",
+            "-c",
+            "15",
+            "8",
+            "3",
+            "-t",
+            "24",
+            "input",
+            "output.bin",
+        ])
+        .unwrap();
+
+        assert!(cli.verbose);
+        match cli.command {
+            Command::Build {
+                channel_volumes,
+                ticks_per_quarter,
+                input_dir,
+                output_firmware,
+            } => {
+                assert_eq!(channel_volumes, Some(vec![15, 8, 3]));
+                assert_eq!(ticks_per_quarter, 24);
+                assert_eq!(input_dir, PathBuf::from("input"));
+                assert_eq!(output_firmware, PathBuf::from("output.bin"));
+            }
+            other => panic!("expected build command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_removed_long_command_names() {
+        let err = Cli::try_parse_from(["harmony-midi", "extract-firmware", "fw.bin", "out"])
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("unrecognized subcommand"));
+        assert!(rendered.contains("extract"));
     }
 }

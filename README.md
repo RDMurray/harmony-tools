@@ -20,13 +20,17 @@ This repository does not include any firmware ROM dumps.
 
 Download prebuilt `harmony-midi` binaries from the [latest release](https://github.com/RDMurray/harmony-tools/releases/latest).
 
+- Linux x86_64: [harmony-midi-x86_64-unknown-linux-gnu.tar.gz](https://github.com/RDMurray/harmony-tools/releases/latest/download/harmony-midi-x86_64-unknown-linux-gnu.tar.gz)
+- macOS Apple Silicon: [harmony-midi-aarch64-apple-darwin.tar.gz](https://github.com/RDMurray/harmony-tools/releases/latest/download/harmony-midi-aarch64-apple-darwin.tar.gz)
+- Windows x86_64: [harmony-midi-x86_64-pc-windows-msvc.zip](https://github.com/RDMurray/harmony-tools/releases/latest/download/harmony-midi-x86_64-pc-windows-msvc.zip)
+
 If you are running from source, use `cargo run -- <command>` in place of `harmony-midi <command>`.
 
 ```bash
-harmony-midi extract-firmware M27C256B.BIN extracted/
-harmony-midi harmony-to-midi extracted/code.bin extracted/song01.bin song01.mid
-harmony-midi midi-to-harmony extracted/code.bin song01.mid song01.bin
-harmony-midi build-firmware extracted/ rebuilt.bin
+harmony-midi extract M27C256B.BIN extracted/
+harmony-midi to-midi extracted/code.bin extracted/song01.bin song01.mid
+harmony-midi to-harmony extracted/code.bin song01.mid song01.bin
+harmony-midi build extracted/ rebuilt.bin
 ```
 
 For full command help:
@@ -47,8 +51,8 @@ cargo test
 Rust tool release:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 This triggers the GitHub Actions release workflow for `harmony-midi` only and uploads Linux, macOS, and Windows CLI archives to the GitHub Release.

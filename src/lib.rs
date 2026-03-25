@@ -133,6 +133,19 @@ struct MidiInterval {
 }
 
 #[derive(Clone, Debug)]
+struct MidiTimingMap {
+    ppqn: u16,
+    tempo_segments: Vec<TempoSegment>,
+}
+
+#[derive(Clone, Debug)]
+struct TempoSegment {
+    start_tick: u32,
+    elapsed_quarter_micros: u128,
+    micros_per_quarter: u32,
+}
+
+#[derive(Clone, Debug)]
 enum OwnedMetaKind {
     TrackName,
 }
@@ -457,6 +470,20 @@ pub fn midi_song_to_harmony_file(
     midi_path: &Path,
     output_path: &Path,
 ) -> Result<Vec<String>> {
+    midi_song_to_harmony_file_with_ticks(
+        code_path,
+        midi_path,
+        output_path,
+        HARMONY_TICKS_PER_QUARTER,
+    )
+}
+
+pub fn midi_song_to_harmony_file_with_ticks(
+    code_path: &Path,
+    midi_path: &Path,
+    output_path: &Path,
+    ticks_per_quarter: u16,
+) -> Result<Vec<String>> {
     let code = fs::read(code_path).with_context(|| format!("reading {}", code_path.display()))?;
     validate_code_section(&code)?;
     let midi_bytes =
@@ -472,11 +499,16 @@ pub fn midi_song_to_harmony_file(
     )?;
     if import_code != code {
         warnings.warn(
-            "song stream was encoded against an auto-promoted full MIDI note table; build-firmware will rewrite the firmware table automatically",
+            "song stream was encoded against an auto-promoted full MIDI note table; build will rewrite the firmware table automatically",
         );
     }
 
-    let stream = midi_bytes_to_harmony_stream(&import_code, &midi_bytes, &mut warnings)?;
+    let stream = midi_bytes_to_harmony_stream_with_ticks(
+        &import_code,
+        &midi_bytes,
+        &mut warnings,
+        ticks_per_quarter,
+    )?;
     fs::write(output_path, stream).with_context(|| format!("writing {}", output_path.display()))?;
     Ok(warnings.into_vec())
 }
@@ -1061,10 +1093,7 @@ fn collect_channel_intervals(
     warnings: &mut WarningCollector,
     ticks_per_quarter: u16,
 ) -> Result<[Vec<MidiInterval>; 3]> {
-    let ppqn = match smf.header.timing {
-        Timing::Metrical(ppqn) => ppqn.as_int(),
-        Timing::Timecode(_, _) => bail!("SMPTE-timed MIDI files are not supported"),
-    };
+    let timing_map = MidiTimingMap::from_smf(smf)?;
     let mut events: [Vec<(u32, usize, CanonicalChannelEvent)>; 3] =
         [Vec::new(), Vec::new(), Vec::new()];
     let mut ignored_channel_warned = [false; 16];
@@ -1136,11 +1165,14 @@ fn collect_channel_intervals(
             match *event {
                 CanonicalChannelEvent::PitchBend(bend) => current_bend = bend,
                 CanonicalChannelEvent::NoteOn { key, .. } => {
-                    let start_q = quantize_tick(*tick, ppqn, warnings, ticks_per_quarter);
+                    let start_q = timing_map.quantize_tick(*tick, warnings, ticks_per_quarter);
                     if let Some((previous_key, previous_start_tick, previous_pitch)) = active.take()
                     {
-                        let previous_start_q =
-                            quantize_tick(previous_start_tick, ppqn, warnings, ticks_per_quarter);
+                        let previous_start_q = timing_map.quantize_tick(
+                            previous_start_tick,
+                            warnings,
+                            ticks_per_quarter,
+                        );
                         if start_q > previous_start_q {
                             voices[channel_index].push(MidiInterval {
                                 start: previous_start_q,
@@ -1167,8 +1199,8 @@ fn collect_channel_intervals(
                         continue;
                     }
                     active = None;
-                    let start_q = quantize_tick(start_tick, ppqn, warnings, ticks_per_quarter);
-                    let mut end_q = quantize_tick(*tick, ppqn, warnings, ticks_per_quarter);
+                    let start_q = timing_map.quantize_tick(start_tick, warnings, ticks_per_quarter);
+                    let mut end_q = timing_map.quantize_tick(*tick, warnings, ticks_per_quarter);
                     if end_q <= start_q {
                         warnings.warn(format!(
                             "note {} on MIDI channel {} collapsed to zero length after quantisation; forcing duration 1 tick",
@@ -1186,8 +1218,8 @@ fn collect_channel_intervals(
             }
         }
         if let Some((_, start_tick, pitch_value)) = active {
-            let start_q = quantize_tick(start_tick, ppqn, warnings, ticks_per_quarter);
-            let mut end_q = quantize_tick(max_tick, ppqn, warnings, ticks_per_quarter);
+            let start_q = timing_map.quantize_tick(start_tick, warnings, ticks_per_quarter);
+            let mut end_q = timing_map.quantize_tick(max_tick, warnings, ticks_per_quarter);
             if end_q <= start_q {
                 end_q = start_q + 1;
             }
@@ -1201,19 +1233,79 @@ fn collect_channel_intervals(
     Ok(voices)
 }
 
-fn quantize_tick(
-    value: u32,
-    input_ppqn: u16,
-    warnings: &mut WarningCollector,
-    ticks_per_quarter: u16,
-) -> u32 {
-    let numerator = u64::from(value) * u64::from(ticks_per_quarter);
-    let denominator = u64::from(input_ppqn);
-    let rounded = ((numerator * 2 + denominator) / (2 * denominator)) as u32;
-    if numerator % denominator != 0 {
-        warnings.note_quantized_event();
+impl MidiTimingMap {
+    fn from_smf(smf: &Smf<'_>) -> Result<Self> {
+        let ppqn = match smf.header.timing {
+            Timing::Metrical(ppqn) => ppqn.as_int(),
+            Timing::Timecode(_, _) => bail!("SMPTE-timed MIDI files are not supported"),
+        };
+
+        let mut tempo_events = Vec::new();
+        for (track_index, track) in smf.tracks.iter().enumerate() {
+            let mut abs_tick = 0u32;
+            for (event_index, event) in track.iter().enumerate() {
+                abs_tick = abs_tick.saturating_add(event.delta.as_int());
+                if let TrackEventKind::Meta(MetaMessage::Tempo(tempo)) = event.kind {
+                    tempo_events.push((
+                        abs_tick,
+                        track_index * 1_000_000 + event_index,
+                        tempo.as_int(),
+                    ));
+                }
+            }
+        }
+        tempo_events.sort_by(|a, b| match a.0.cmp(&b.0) {
+            Ordering::Equal => a.1.cmp(&b.1),
+            other => other,
+        });
+
+        let mut tempo_segments = vec![TempoSegment {
+            start_tick: 0,
+            elapsed_quarter_micros: 0,
+            micros_per_quarter: 500_000,
+        }];
+        for (tick, _, micros_per_quarter) in tempo_events {
+            let last = tempo_segments.last_mut().unwrap();
+            if tick == last.start_tick {
+                last.micros_per_quarter = micros_per_quarter;
+                continue;
+            }
+            let elapsed_quarter_micros = last.elapsed_quarter_micros
+                + u128::from(tick - last.start_tick) * u128::from(last.micros_per_quarter);
+            tempo_segments.push(TempoSegment {
+                start_tick: tick,
+                elapsed_quarter_micros,
+                micros_per_quarter,
+            });
+        }
+
+        Ok(Self {
+            ppqn,
+            tempo_segments,
+        })
     }
-    rounded
+
+    fn quantize_tick(
+        &self,
+        value: u32,
+        warnings: &mut WarningCollector,
+        ticks_per_quarter: u16,
+    ) -> u32 {
+        let segment_index = self
+            .tempo_segments
+            .partition_point(|segment| segment.start_tick <= value)
+            .saturating_sub(1);
+        let segment = &self.tempo_segments[segment_index];
+        let elapsed_quarter_micros = segment.elapsed_quarter_micros
+            + u128::from(value - segment.start_tick) * u128::from(segment.micros_per_quarter);
+        let numerator = elapsed_quarter_micros * u128::from(ticks_per_quarter);
+        let denominator = u128::from(self.ppqn) * 500_000u128;
+        let rounded = ((numerator * 2 + denominator) / (2 * denominator)) as u32;
+        if numerator % denominator != 0 {
+            warnings.note_quantized_event();
+        }
+        rounded
+    }
 }
 
 fn build_voice_segments_from_intervals(
@@ -1562,6 +1654,57 @@ mod tests {
         bytes
     }
 
+    fn single_note_midi_bytes_with_tempo(
+        note: u8,
+        duration_ticks: u32,
+        ppqn: u16,
+        micros_per_quarter: u32,
+    ) -> Vec<u8> {
+        midi_bytes_with_tracks(
+            ppqn,
+            vec![
+                vec![
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::new(
+                            micros_per_quarter,
+                        ))),
+                    },
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                    },
+                ],
+                vec![
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOn {
+                                key: u7::new(note),
+                                vel: u7::new(100),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(duration_ticks),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOff {
+                                key: u7::new(note),
+                                vel: u7::new(0),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                    },
+                ],
+            ],
+        )
+    }
+
     fn midi_bytes_with_tracks(ppqn: u16, tracks: Vec<Vec<TrackEvent<'static>>>) -> Vec<u8> {
         let smf = Smf {
             header: Header {
@@ -1655,6 +1798,116 @@ mod tests {
             midi_bytes_to_harmony_stream_with_ticks(&code, &bytes, &mut warnings, 20).unwrap();
         let voices = decode_stream_to_voice_segments(&stream).unwrap();
         assert_eq!(voices[0][0].duration, 20);
+    }
+
+    #[test]
+    fn midi_import_uses_tempo_to_shorten_faster_sections() {
+        let bytes = single_note_midi_bytes_with_tempo(60, 10, 10, 250_000);
+
+        let mut warnings = WarningCollector::new();
+        let code = sample_code();
+        let stream = midi_bytes_to_harmony_stream(&code, &bytes, &mut warnings).unwrap();
+        let voices = decode_stream_to_voice_segments(&stream).unwrap();
+        assert_eq!(voices[0][0].duration, 16);
+    }
+
+    #[test]
+    fn midi_import_uses_tempo_to_extend_slower_sections() {
+        let bytes = single_note_midi_bytes_with_tempo(60, 10, 10, 1_000_000);
+
+        let mut warnings = WarningCollector::new();
+        let code = sample_code();
+        let stream = midi_bytes_to_harmony_stream(&code, &bytes, &mut warnings).unwrap();
+        let voices = decode_stream_to_voice_segments(&stream).unwrap();
+        assert_eq!(voices[0][0].duration, 64);
+    }
+
+    #[test]
+    fn midi_import_applies_tempo_changes_mid_song() {
+        let midi = midi_bytes_with_tracks(
+            10,
+            vec![
+                vec![
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::new(500_000))),
+                    },
+                    TrackEvent {
+                        delta: u28::new(10),
+                        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::new(250_000))),
+                    },
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                    },
+                ],
+                vec![
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOn {
+                                key: u7::new(60),
+                                vel: u7::new(100),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(10),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOff {
+                                key: u7::new(60),
+                                vel: u7::new(0),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOn {
+                                key: u7::new(62),
+                                vel: u7::new(100),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(10),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOff {
+                                key: u7::new(62),
+                                vel: u7::new(0),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                    },
+                ],
+            ],
+        );
+
+        let mut warnings = WarningCollector::new();
+        let code = sample_code();
+        let stream = midi_bytes_to_harmony_stream(&code, &midi, &mut warnings).unwrap();
+        let voices = decode_stream_to_voice_segments(&stream).unwrap();
+        assert_eq!(voices[0][0].duration, 32);
+        assert_eq!(voices[0][1].duration, 16);
+    }
+
+    #[test]
+    fn midi_import_scales_tempo_aware_durations_with_custom_ticks_per_quarter() {
+        let bytes = single_note_midi_bytes_with_tempo(60, 10, 10, 250_000);
+
+        let mut warnings = WarningCollector::new();
+        let code = sample_code();
+        let stream =
+            midi_bytes_to_harmony_stream_with_ticks(&code, &bytes, &mut warnings, 20).unwrap();
+        let voices = decode_stream_to_voice_segments(&stream).unwrap();
+        assert_eq!(voices[0][0].duration, 10);
     }
 
     #[test]
@@ -1865,6 +2118,37 @@ mod tests {
             read_channel_volumes(&firmware[..DEFAULT_CODE_SECTION_LEN]).unwrap(),
             [15, 8, 3]
         );
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn build_firmware_uses_tempo_aware_midi_import() {
+        let input_dir = temp_test_dir("tempo-build-input");
+        let output_path = temp_test_dir("tempo-build-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+        fs::write(
+            input_dir.join("bank01_song01.mid"),
+            single_note_midi_bytes_with_tempo(60, 10, 10, 250_000),
+        )
+        .unwrap();
+
+        let report = build_firmware_from_dir(&input_dir, &output_path).unwrap();
+        assert_eq!(report.banks.len(), 1);
+
+        let firmware = fs::read(&output_path).unwrap();
+        let bank = &firmware[..BANK_SIZE];
+        let pointers = parse_pointer_table(bank).unwrap();
+        let start = usize::from(pointers[0]);
+        let end = bank[start..]
+            .iter()
+            .position(|&b| b == 0xFF)
+            .map(|idx| start + idx + 1)
+            .unwrap();
+        let voices = decode_stream_to_voice_segments(&bank[start..end]).unwrap();
+        assert_eq!(voices[0][0].duration, 16);
 
         let _ = fs::remove_dir_all(&input_dir);
         let _ = fs::remove_file(&output_path);
