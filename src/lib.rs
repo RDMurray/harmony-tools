@@ -1345,7 +1345,7 @@ fn build_voice_segments_from_intervals(
                     },
                 );
             }
-            push_segment_split(
+            push_interval_segment(
                 &mut out[voice_index],
                 HarmonySegment {
                     idx: nearest_idx_for_pitch(note_mapping, interval.pitch_value),
@@ -1367,6 +1367,27 @@ fn build_voice_segments_from_intervals(
         }
     }
     out
+}
+
+fn push_interval_segment(target: &mut Vec<HarmonySegment>, segment: HarmonySegment) {
+    if !segment.voiced || segment.duration <= 0x7F {
+        push_segment_split(target, segment);
+        return;
+    }
+
+    target.push(HarmonySegment {
+        idx: segment.idx,
+        duration: 0x7F,
+        voiced: true,
+    });
+    push_segment_split(
+        target,
+        HarmonySegment {
+            idx: 0x00,
+            duration: segment.duration - 0x7F,
+            voiced: false,
+        },
+    );
 }
 
 fn push_segment_split(target: &mut Vec<HarmonySegment>, segment: HarmonySegment) {
@@ -1908,6 +1929,94 @@ mod tests {
             midi_bytes_to_harmony_stream_with_ticks(&code, &bytes, &mut warnings, 20).unwrap();
         let voices = decode_stream_to_voice_segments(&stream).unwrap();
         assert_eq!(voices[0][0].duration, 10);
+    }
+
+    #[test]
+    fn overly_long_midi_notes_are_trimmed_instead_of_retriggered() {
+        let bytes = single_note_midi_bytes(60, 200, HARMONY_TICKS_PER_QUARTER);
+
+        let mut warnings = WarningCollector::new();
+        let code = sample_code();
+        let stream = midi_bytes_to_harmony_stream(&code, &bytes, &mut warnings).unwrap();
+        let voices = decode_stream_to_voice_segments(&stream).unwrap();
+
+        assert_eq!(voices[0].len(), 2);
+        assert_eq!(voices[0][0].duration, 0x7F);
+        assert!(voices[0][0].voiced);
+        assert_eq!(voices[0][1].duration, 73);
+        assert!(!voices[0][1].voiced);
+    }
+
+    #[test]
+    fn trimmed_long_notes_preserve_later_note_start_times_with_silence() {
+        let midi = midi_bytes_with_tracks(
+            HARMONY_TICKS_PER_QUARTER,
+            vec![
+                vec![TrackEvent {
+                    delta: u28::new(0),
+                    kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                }],
+                vec![
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOn {
+                                key: u7::new(60),
+                                vel: u7::new(100),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(200),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOff {
+                                key: u7::new(60),
+                                vel: u7::new(0),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOn {
+                                key: u7::new(62),
+                                vel: u7::new(100),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(8),
+                        kind: TrackEventKind::Midi {
+                            channel: u4::new(0),
+                            message: MidiMessage::NoteOff {
+                                key: u7::new(62),
+                                vel: u7::new(0),
+                            },
+                        },
+                    },
+                    TrackEvent {
+                        delta: u28::new(0),
+                        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+                    },
+                ],
+            ],
+        );
+
+        let mut warnings = WarningCollector::new();
+        let code = sample_code();
+        let stream = midi_bytes_to_harmony_stream(&code, &midi, &mut warnings).unwrap();
+        let voices = decode_stream_to_voice_segments(&stream).unwrap();
+
+        assert_eq!(voices[0].len(), 3);
+        assert_eq!(voices[0][0].duration, 0x7F);
+        assert!(voices[0][0].voiced);
+        assert_eq!(voices[0][1].duration, 73);
+        assert!(!voices[0][1].voiced);
+        assert_eq!(voices[0][2].duration, 8);
+        assert!(voices[0][2].voiced);
     }
 
     #[test]
