@@ -53,6 +53,7 @@ typedef struct {
 } YM2149Core;
 
 void ym2149_init(YM2149Core *ym, uint32_t clock_hz, uint32_t sample_rate);
+void ym2149_set_clock(YM2149Core *ym, uint32_t clock_hz);
 void ym2149_reset(YM2149Core *ym);
 void ym2149_write_address(YM2149Core *ym, uint8_t reg);
 void ym2149_write_data(YM2149Core *ym, uint8_t value);

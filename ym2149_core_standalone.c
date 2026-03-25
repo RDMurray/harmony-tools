@@ -158,6 +158,15 @@ void ym2149_init(YM2149Core *ym, uint32_t clock_hz, uint32_t sample_rate) {
     ym2149_reset(ym);
 }
 
+void ym2149_set_clock(YM2149Core *ym, uint32_t clock_hz) {
+    if (!ym || clock_hz == 0) {
+        return;
+    }
+
+    ym->chip_clock_hz = clock_hz;
+    ym->chip_sample_rate = (clock_hz > 7) ? (clock_hz / 8u) : 1u;
+}
+
 void ym2149_reset(YM2149Core *ym) {
     ym->active = 0;
     ym->selected_reg = 0;

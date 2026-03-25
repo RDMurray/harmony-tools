@@ -209,6 +209,36 @@ H32_KEEPALIVE int h32_set_controls(H32Engine *engine, uint8_t song, uint32_t ban
     return 0;
 }
 
+H32_KEEPALIVE int h32_set_cpu_hz(H32Engine *engine, uint32_t cpu_hz) {
+    double ratio;
+
+    if (!engine || cpu_hz == 0) {
+        return -1;
+    }
+
+    if (engine->cpu_hz == cpu_hz) {
+        return 0;
+    }
+
+    ratio = (double)engine->cpu_hz / (double)cpu_hz;
+    engine->cpu_hz = cpu_hz;
+    engine->sample_cursor *= ratio;
+    return 0;
+}
+
+H32_KEEPALIVE int h32_set_ym_hz(H32Engine *engine, uint32_t ym_hz) {
+    if (!engine || ym_hz == 0) {
+        return -1;
+    }
+
+    if (engine->ym.chip_clock_hz == ym_hz) {
+        return 0;
+    }
+
+    ym2149_set_clock(&engine->ym, ym_hz);
+    return 0;
+}
+
 H32_KEEPALIVE int h32_set_channel_mix(H32Engine *engine, uint8_t channel, int32_t level_pct, int32_t pan_pct) {
     if (!engine || channel > 2 || level_pct < 0 || level_pct > 100 || pan_pct < -100 || pan_pct > 100) {
         return -1;
@@ -376,6 +406,7 @@ H32_KEEPALIVE int h32_get_status(const H32Engine *engine, H32Status *out_status)
     out_status->drums_on = engine->drums_on;
     out_status->sample_rate = engine->sample_rate;
     out_status->cpu_hz = engine->cpu_hz;
+    out_status->ym_hz = engine->ym.chip_clock_hz;
     out_status->steps = engine->steps;
 
     return 0;

@@ -9,9 +9,11 @@ class Harmony32Processor extends AudioWorkletProcessor {
     this.romBuffer = options.processorOptions.romBuffer;
     this.sampleRateOverride = options.processorOptions.sampleRate || sampleRate;
     this.cpuHz = options.processorOptions.cpuHz || 2000000;
+    this.ymHz = options.processorOptions.ymHz || 2000000;
 
     this.ctrlSab = options.processorOptions.controlSab;
     this.ctrl = this.ctrlSab ? new Int32Array(this.ctrlSab) : null;
+    this.ctrlU32 = this.ctrlSab ? new Uint32Array(this.ctrlSab) : null;
 
     this.ready = false;
     this.failed = false;
@@ -21,7 +23,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
     this.stemPtr = 0;
     this.outFrames = 128;
     this.statusPtr = 0;
-    this.statusStride = 28;
+    this.statusStride = 32;
     this.statusTicker = 0;
     this.satLastIn = [0.0, 0.0, 0.0];
     this.satLastOut = [0.0, 0.0, 0.0];
@@ -59,7 +61,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
         }
       });
 
-      this.engine = this.mod._h32_create(this.sampleRateOverride | 0, this.cpuHz | 0);
+      this.engine = this.mod._h32_create(this.sampleRateOverride | 0, this.cpuHz >>> 0);
       if (!this.engine) {
         throw new Error("h32_create failed");
       }
@@ -118,6 +120,8 @@ class Harmony32Processor extends AudioWorkletProcessor {
     let chBPan = 0;
     let chCPan = 0;
     let mixMode = 1;
+    let cpuHz = this.cpuHz;
+    let ymHz = this.ymHz;
 
     if (this.ctrl) {
       song = Atomics.load(this.ctrl, 1);
@@ -132,6 +136,10 @@ class Harmony32Processor extends AudioWorkletProcessor {
       chBPan = Atomics.load(this.ctrl, 10);
       chCPan = Atomics.load(this.ctrl, 11);
       mixMode = Atomics.load(this.ctrl, 15);
+      if (this.ctrlU32) {
+        cpuHz = Atomics.load(this.ctrlU32, 16) >>> 0;
+        ymHz = Atomics.load(this.ctrlU32, 17) >>> 0;
+      }
       if (!forceReset) {
         Atomics.store(this.ctrl, 0, 0);
       }
@@ -140,10 +148,20 @@ class Harmony32Processor extends AudioWorkletProcessor {
     if (mixMode !== 0 && mixMode !== 1) {
       mixMode = 1;
     }
+    if (!Number.isFinite(cpuHz) || cpuHz <= 0) {
+      cpuHz = 2000000;
+    }
+    if (!Number.isFinite(ymHz) || ymHz <= 0) {
+      ymHz = 2000000;
+    }
+    this.cpuHz = cpuHz;
+    this.ymHz = ymHz;
 
     if (forceReset) {
       this.mod._h32_reset_full(this.engine, song, bank >>> 0);
     }
+    this.mod._h32_set_cpu_hz(this.engine, cpuHz >>> 0);
+    this.mod._h32_set_ym_hz(this.engine, ymHz >>> 0);
     this.mod._h32_set_controls(this.engine, song, bank >>> 0, speed, drumsOn, running);
     this.mod._h32_set_mix_mode(this.engine, mixMode);
 
@@ -212,7 +230,8 @@ class Harmony32Processor extends AudioWorkletProcessor {
       bankCount: u32[baseU32 + 3],
       sampleRate: u32[baseU32 + 4],
       cpuHz: u32[baseU32 + 5],
-      steps: u32[baseU32 + 6]
+      ymHz: u32[baseU32 + 6],
+      steps: u32[baseU32 + 7]
     };
 
     this.port.postMessage({ type: "status", status });

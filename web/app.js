@@ -13,6 +13,8 @@ const els = {
   speed3Btn: document.getElementById("speed3Btn"),
   speed4Btn: document.getElementById("speed4Btn"),
   drumsSwitch: document.getElementById("drumsSwitch"),
+  cpuFreqInput: document.getElementById("cpuFreqInput"),
+  ymFreqInput: document.getElementById("ymFreqInput"),
   mixLegacyBtn: document.getElementById("mixLegacyBtn"),
   mixStemBtn: document.getElementById("mixStemBtn"),
 
@@ -65,8 +67,16 @@ const CONTROL_IDX = {
   chADrive: 12,
   chBDrive: 13,
   chCDrive: 14,
-  mixMode: 15
+  mixMode: 15,
+  cpuHz: 16,
+  ymHz: 17
 };
+
+const DEFAULT_CPU_HZ = 2000000;
+const DEFAULT_CPU_MHZ = DEFAULT_CPU_HZ / 1000000;
+const DEFAULT_YM_HZ = 2000000;
+const DEFAULT_YM_MHZ = DEFAULT_YM_HZ / 1000000;
+const MAX_CPU_HZ = 0xffffffff;
 
 let ctx = null;
 let node = null;
@@ -76,6 +86,7 @@ let convolverNode = null;
 let compressorNode = null;
 let controlSab = null;
 let control = null;
+let controlU32 = null;
 let romBuffer = null;
 let wasmBinaryBuffer = null;
 let bundledRoms = [];
@@ -87,6 +98,8 @@ let currentBankUi = 1;
 let bankCountUi = 1;
 let currentSpeedUi = 2;
 let currentMixMode = 1;
+let currentCpuHzUi = DEFAULT_CPU_HZ;
+let currentYmHzUi = DEFAULT_YM_HZ;
 
 function setPlayEnabled(enabled) {
   if (els.playPauseBtn) {
@@ -119,6 +132,63 @@ function clampInt(value, min, max, fallback) {
     return fallback;
   }
   return Math.max(min, Math.min(max, parsed));
+}
+
+function parseCpuMHz(value) {
+  const parsed = Number.parseFloat(String(value));
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatCpuMHz(value) {
+  const normalized = Number.isFinite(value) && value > 0 ? value : DEFAULT_CPU_MHZ;
+  return normalized.toFixed(6).replace(/\.?0+$/, "");
+}
+
+function cpuMHzToHz(mhz) {
+  const hz = Math.round(mhz * 1000000);
+  if (!Number.isFinite(hz) || hz <= 0) {
+    return DEFAULT_CPU_HZ;
+  }
+  return Math.max(1, Math.min(MAX_CPU_HZ, hz));
+}
+
+function readCpuHzFromUi() {
+  const parsedMHz = parseCpuMHz(els.cpuFreqInput && els.cpuFreqInput.value);
+  return parsedMHz === null ? currentCpuHzUi : cpuMHzToHz(parsedMHz);
+}
+
+function syncCpuInputFromHz(cpuHz) {
+  if (!els.cpuFreqInput) {
+    return;
+  }
+  const normalizedHz = Number.isFinite(cpuHz) && cpuHz > 0 ? Math.min(MAX_CPU_HZ, Math.round(cpuHz)) : DEFAULT_CPU_HZ;
+  currentCpuHzUi = normalizedHz;
+  els.cpuFreqInput.value = formatCpuMHz(normalizedHz / 1000000);
+}
+
+function ymMHzToHz(mhz) {
+  const hz = Math.round(mhz * 1000000);
+  if (!Number.isFinite(hz) || hz <= 0) {
+    return DEFAULT_YM_HZ;
+  }
+  return Math.max(1, Math.min(MAX_CPU_HZ, hz));
+}
+
+function readYmHzFromUi() {
+  const parsedMHz = parseCpuMHz(els.ymFreqInput && els.ymFreqInput.value);
+  return parsedMHz === null ? currentYmHzUi : ymMHzToHz(parsedMHz);
+}
+
+function syncYmInputFromHz(ymHz) {
+  if (!els.ymFreqInput) {
+    return;
+  }
+  const normalizedHz = Number.isFinite(ymHz) && ymHz > 0 ? Math.min(MAX_CPU_HZ, Math.round(ymHz)) : DEFAULT_YM_HZ;
+  currentYmHzUi = normalizedHz;
+  els.ymFreqInput.value = formatCpuMHz(normalizedHz / 1000000);
 }
 
 function setBankCount(nextCount) {
@@ -164,7 +234,9 @@ function readControls(runningOverride) {
     chADrive,
     chBDrive,
     chCDrive,
-    mixMode: currentMixMode
+    mixMode: currentMixMode,
+    cpuHz: readCpuHzFromUi(),
+    ymHz: readYmHzFromUi()
   };
 }
 
@@ -273,6 +345,8 @@ function writeControlBlock(values, markDirty = true) {
   Atomics.store(control, CONTROL_IDX.chBDrive, values.chBDrive);
   Atomics.store(control, CONTROL_IDX.chCDrive, values.chCDrive);
   Atomics.store(control, CONTROL_IDX.mixMode, values.mixMode);
+  Atomics.store(controlU32, CONTROL_IDX.cpuHz, values.cpuHz >>> 0);
+  Atomics.store(controlU32, CONTROL_IDX.ymHz, values.ymHz >>> 0);
   if (markDirty) {
     Atomics.store(control, CONTROL_IDX.dirty, 1);
   }
@@ -446,6 +520,7 @@ async function ensureAudio() {
 
   controlSab = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 32);
   control = new Int32Array(controlSab);
+  controlU32 = new Uint32Array(controlSab);
   writeControlBlock(readControls(1), false);
 
   ctx = new AudioContext({ latencyHint: "interactive" });
@@ -459,7 +534,8 @@ async function ensureAudio() {
       wasmBinary: wasmBinaryBuffer,
       romBuffer,
       sampleRate: ctx.sampleRate,
-      cpuHz: 2000000,
+      cpuHz: readCpuHzFromUi(),
+      ymHz: readYmHzFromUi(),
       controlSab
     }
   });
@@ -504,6 +580,12 @@ async function ensureAudio() {
         currentMixMode = msg.status.mixMode === 0 ? 0 : 1;
         renderControlState();
       }
+      if (typeof msg.status.cpuHz === "number" && msg.status.cpuHz > 0 && document.activeElement !== els.cpuFreqInput) {
+        syncCpuInputFromHz(msg.status.cpuHz);
+      }
+      if (typeof msg.status.ymHz === "number" && msg.status.ymHz > 0 && document.activeElement !== els.ymFreqInput) {
+        syncYmInputFromHz(msg.status.ymHz);
+      }
     }
   };
 
@@ -535,7 +617,7 @@ async function startAudio() {
   await ensureAudio();
   writeControlBlock(readControls(1));
   await ctx.resume();
-  setAudioStateMessage(`running @ ${ctx.sampleRate}Hz`);
+  setAudioStateMessage(`running @ ${ctx.sampleRate}Hz / CPU ${formatCpuMHz(readCpuHzFromUi() / 1000000)}MHz / YM ${formatCpuMHz(readYmHzFromUi() / 1000000)}MHz`);
   setPlayPauseVisualState(true);
 }
 
@@ -623,6 +705,32 @@ function wireEvents() {
     applyControls();
   };
 
+  const instantCpuApply = () => {
+    if (parseCpuMHz(els.cpuFreqInput && els.cpuFreqInput.value) === null) {
+      return;
+    }
+    currentCpuHzUi = readCpuHzFromUi();
+    applyControls();
+  };
+
+  const commitCpuApply = () => {
+    syncCpuInputFromHz(readCpuHzFromUi());
+    applyControls();
+  };
+
+  const instantYmApply = () => {
+    if (parseCpuMHz(els.ymFreqInput && els.ymFreqInput.value) === null) {
+      return;
+    }
+    currentYmHzUi = readYmHzFromUi();
+    applyControls();
+  };
+
+  const commitYmApply = () => {
+    syncYmInputFromHz(readYmHzFromUi());
+    applyControls();
+  };
+
   const instantUiOnly = () => {
     renderControlState();
   };
@@ -690,6 +798,10 @@ function wireEvents() {
   });
 
   els.drumsSwitch.addEventListener("change", instantApply);
+  els.cpuFreqInput.addEventListener("input", instantCpuApply);
+  els.cpuFreqInput.addEventListener("change", commitCpuApply);
+  els.ymFreqInput.addEventListener("input", instantYmApply);
+  els.ymFreqInput.addEventListener("change", commitYmApply);
   els.chALevel.addEventListener("input", instantApply);
   els.chBLevel.addEventListener("input", instantApply);
   els.chCLevel.addEventListener("input", instantApply);
@@ -735,6 +847,8 @@ function wireEvents() {
 
 setPlayPauseVisualState(false);
 setPlayEnabled(false);
+syncCpuInputFromHz(DEFAULT_CPU_HZ);
+syncYmInputFromHz(DEFAULT_YM_HZ);
 renderControlState();
 wireEvents();
 Promise.all([
