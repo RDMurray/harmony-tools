@@ -34,7 +34,6 @@ struct FurnaceInfo {
 
 #[derive(Clone, Debug)]
 struct FurnaceSubsong {
-    total_channels: usize,
     ticks_per_second: f32,
     pattern_length: usize,
     orders_length: usize,
@@ -58,7 +57,22 @@ struct FurnacePattern {
 struct PatternRow {
     note: Option<u8>,
     volume: Option<u8>,
-    has_effects: bool,
+    effects: Vec<PatternEffect>,
+}
+
+#[derive(Clone, Debug)]
+struct PatternEffect {
+    command: u8,
+    value: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FlowControl {
+    ScheduledJump {
+        target_order: Option<usize>,
+        start_row: usize,
+    },
+    Stop,
 }
 
 pub(crate) fn parse_furnace_bytes(
@@ -87,7 +101,7 @@ pub(crate) fn parse_furnace_bytes(
         .with_context(|| format!("parsing INF2 from {display_name}"))?;
     let subsongs = parse_subsongs(&decoded, &info)
         .with_context(|| format!("parsing subsongs from {display_name}"))?;
-    let patterns = parse_patterns(&decoded, &info.pattern_pointers)
+    let patterns = parse_patterns(&decoded, version, &info.pattern_pointers)
         .with_context(|| format!("parsing patterns from {display_name}"))?;
     let pattern_map: HashMap<(usize, usize, u16), FurnacePattern> = patterns
         .into_iter()
@@ -324,7 +338,6 @@ fn parse_subsongs(bytes: &[u8], info: &FurnaceInfo) -> Result<Vec<FurnaceSubsong
         }
 
         out.push(FurnaceSubsong {
-            total_channels: info.total_channels,
             ticks_per_second,
             pattern_length,
             orders_length,
@@ -339,7 +352,7 @@ fn parse_subsongs(bytes: &[u8], info: &FurnaceInfo) -> Result<Vec<FurnaceSubsong
     Ok(out)
 }
 
-fn parse_patterns(bytes: &[u8], pointers: &[u32]) -> Result<Vec<FurnacePattern>> {
+fn parse_patterns(bytes: &[u8], _version: u16, pointers: &[u32]) -> Result<Vec<FurnacePattern>> {
     let mut out = Vec::with_capacity(pointers.len());
     for &ptr in pointers {
         let mut reader = CursorReader::at(bytes, ptr as usize)?;
@@ -352,8 +365,7 @@ fn parse_patterns(bytes: &[u8], pointers: &[u32]) -> Result<Vec<FurnacePattern>>
         reader.ensure_within(block_end)?;
 
         let subsong_index = usize::from(reader.read_u8()?);
-        let _legacy_channel = reader.read_u8()?;
-        let channel_index = usize::from(reader.read_u16()?);
+        let channel_index = usize::from(reader.read_u8()?);
         let pattern_index = reader.read_u16()?;
         let _name = reader.read_c_string()?;
 
@@ -404,6 +416,7 @@ fn parse_patterns(bytes: &[u8], pointers: &[u32]) -> Result<Vec<FurnacePattern>>
             } else {
                 None
             };
+            let mut effects = Vec::new();
             for slot in 0..8 {
                 let cmd_present = if slot == 0 {
                     (control & 0x08) != 0 || (effect_mask_lo & 0x01) != 0
@@ -419,11 +432,17 @@ fn parse_patterns(bytes: &[u8], pointers: &[u32]) -> Result<Vec<FurnacePattern>>
                 } else {
                     (effect_mask_hi & (1 << ((slot - 4) * 2 + 1))) != 0
                 };
+                let mut command = None;
+                let mut value = None;
                 if cmd_present {
-                    let _ = reader.read_u8()?;
+                    command = Some(reader.read_u8()?);
                 }
                 if val_present {
-                    let _ = reader.read_u8()?;
+                    value = Some(reader.read_u8()?);
+                }
+                if let Some(command) = command {
+                    let _ = slot;
+                    effects.push(PatternEffect { command, value });
                 }
             }
 
@@ -432,7 +451,7 @@ fn parse_patterns(bytes: &[u8], pointers: &[u32]) -> Result<Vec<FurnacePattern>>
                 PatternRow {
                     note,
                     volume,
-                    has_effects: effect_present,
+                    effects,
                 },
             );
             row_index = row_index.saturating_add(1);
@@ -460,32 +479,77 @@ fn build_subsong_voices(
     let mut active: [Option<(u32, f64)>; 3] = [None, None, None];
     let mut raw_time = 0.0f64;
     let mut speed_cursor = 0usize;
+    let mut order_index = 0usize;
+    let mut row = 0usize;
 
-    for order_index in 0..subsong.orders_length {
-        for row in 0..subsong.pattern_length {
+    while order_index < subsong.orders_length {
+        while row < subsong.pattern_length {
             let row_start = quantize_time(raw_time, warnings);
+            let mut flow_control = None;
             for voice_index in 0..3 {
                 let channel_index = ay_channel_offset + voice_index;
-                let order_offset = order_index * subsong.total_channels + channel_index;
+                let order_offset = channel_index * subsong.orders_length + order_index;
                 let order_value = subsong.orders[order_offset];
                 let row_data = patterns
                     .get(&(subsong_index, channel_index, u16::from(order_value)))
                     .and_then(|pattern| pattern.rows.get(&row));
                 if let Some(row_data) = row_data {
-                    if row_data.volume.is_some() {
-                        bail!(
-                            "{} subsong {} channel {} uses volume column data, which is unsupported in strict Furnace import",
-                            display_name,
-                            subsong_index,
-                            char::from(b'A' + voice_index as u8)
-                        );
+                    for effect in &row_data.effects {
+                        match effect.command {
+                            0x0D => {
+                                let target_order = match flow_control {
+                                    Some(FlowControl::ScheduledJump {
+                                        target_order,
+                                        start_row: _,
+                                    }) => target_order,
+                                    _ => None,
+                                };
+                                flow_control = Some(FlowControl::ScheduledJump {
+                                    target_order,
+                                    start_row: usize::from(effect.value.unwrap_or(0)),
+                                });
+                            }
+                            0x0B => {
+                                let target = usize::from(effect.value.unwrap_or(0));
+                                if target <= order_index {
+                                    bail!(
+                                        "{} subsong {} channel {} uses backward order jump 0B{:02X}, which cannot be linearized safely",
+                                        display_name,
+                                        subsong_index,
+                                        char::from(b'A' + voice_index as u8),
+                                        effect.value.unwrap_or(0)
+                                    );
+                                }
+                                let start_row = match flow_control {
+                                    Some(FlowControl::ScheduledJump {
+                                        target_order: _,
+                                        start_row,
+                                    }) => start_row,
+                                    _ => 0,
+                                };
+                                flow_control = Some(FlowControl::ScheduledJump {
+                                    target_order: Some(target),
+                                    start_row,
+                                });
+                            }
+                            0x20 => {}
+                            0xFF => flow_control = Some(FlowControl::Stop),
+                            _ => {
+                                bail!(
+                                    "{} subsong {} channel {} uses unsupported effect {:02X}",
+                                    display_name,
+                                    subsong_index,
+                                    char::from(b'A' + voice_index as u8),
+                                    effect.command
+                                );
+                            }
+                        }
                     }
-                    if row_data.has_effects {
-                        bail!(
-                            "{} subsong {} channel {} uses pattern effects, which are unsupported in strict Furnace import",
-                            display_name,
-                            subsong_index,
-                            char::from(b'A' + voice_index as u8)
+                    if row_data.volume == Some(0) && row_data.note.is_none() {
+                        close_active_interval(
+                            &mut voices[voice_index],
+                            &mut active[voice_index],
+                            row_start,
                         );
                     }
                     if let Some(note) = row_data.note {
@@ -496,8 +560,10 @@ fn build_subsong_voices(
                                     &mut active[voice_index],
                                     row_start,
                                 );
-                                let midi_pitch = furnace_note_to_midi_pitch(note)?;
-                                active[voice_index] = Some((row_start, midi_pitch));
+                                if row_data.volume != Some(0) {
+                                    let midi_pitch = furnace_note_to_midi_pitch(note)?;
+                                    active[voice_index] = Some((row_start, midi_pitch));
+                                }
                             }
                             180..=182 => {
                                 close_active_interval(
@@ -517,6 +583,30 @@ fn build_subsong_voices(
                 / (f64::from(subsong.ticks_per_second) * f64::from(subsong.virtual_tempo_num))
                 * HARMONY_TICKS_PER_SECOND;
             speed_cursor += 1;
+            row += 1;
+
+            match flow_control {
+                Some(FlowControl::ScheduledJump {
+                    target_order,
+                    start_row,
+                }) => {
+                    order_index = target_order.unwrap_or(order_index + 1);
+                    row = start_row;
+                    break;
+                }
+                Some(FlowControl::Stop) => {
+                    order_index = subsong.orders_length;
+                    break;
+                }
+                None => {}
+            }
+        }
+        if order_index >= subsong.orders_length {
+            break;
+        }
+        if row >= subsong.pattern_length {
+            order_index += 1;
+            row = 0;
         }
     }
 

@@ -2037,8 +2037,7 @@ mod tests {
     fn build_test_pattern_block(pattern: &TestFurnacePattern) -> Vec<u8> {
         let mut body = Vec::new();
         body.push(pattern.subsong);
-        body.push(0);
-        body.extend_from_slice(&pattern.channel.to_le_bytes());
+        body.push(pattern.channel as u8);
         body.extend_from_slice(&pattern.index.to_le_bytes());
         push_c_string(&mut body, "");
 
@@ -2271,6 +2270,81 @@ mod tests {
             },
         ];
         (subsong, patterns)
+    }
+
+    #[test]
+    fn furnace_parser_reads_channel_major_order_tables() {
+        let subsong = TestFurnaceSubsong {
+            name: "orders",
+            ticks_per_second: 64.0,
+            speed_pattern: vec![1],
+            pattern_length: 1,
+            orders: vec![0, 1, 2, 3, 4, 5],
+        };
+        let patterns = vec![
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 0,
+                index: 0,
+                rows: vec![(0, TestFurnaceRow { note: Some(108), ..Default::default() })],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 0,
+                index: 1,
+                rows: vec![(0, TestFurnaceRow { note: Some(109), ..Default::default() })],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 1,
+                index: 2,
+                rows: vec![(0, TestFurnaceRow { note: Some(110), ..Default::default() })],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 1,
+                index: 3,
+                rows: vec![(0, TestFurnaceRow { note: Some(111), ..Default::default() })],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 2,
+                index: 4,
+                rows: vec![(0, TestFurnaceRow { note: Some(112), ..Default::default() })],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 2,
+                index: 5,
+                rows: vec![(0, TestFurnaceRow { note: Some(113), ..Default::default() })],
+            },
+        ];
+        let module = build_test_furnace_module(&[(0x80, 3)], &[subsong], &patterns);
+        let parsed =
+            parse_furnace_bytes("orders.fur", &module, &mut WarningCollector::new()).unwrap();
+
+        assert_eq!(parsed.subsongs.len(), 1);
+        assert_eq!(
+            parsed.subsongs[0].voices[0]
+                .iter()
+                .map(|interval| interval.pitch_value)
+                .collect::<Vec<_>>(),
+            vec![60.0, 61.0]
+        );
+        assert_eq!(
+            parsed.subsongs[0].voices[1]
+                .iter()
+                .map(|interval| interval.pitch_value)
+                .collect::<Vec<_>>(),
+            vec![62.0, 63.0]
+        );
+        assert_eq!(
+            parsed.subsongs[0].voices[2]
+                .iter()
+                .map(|interval| interval.pitch_value)
+                .collect::<Vec<_>>(),
+            vec![64.0, 65.0]
+        );
     }
 
     #[test]
