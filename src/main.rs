@@ -76,7 +76,7 @@ fn main() -> Result<()> {
             );
             println!("code section per bank: {} bytes", report.code_section_bytes);
             println!(
-                "MIDI import baseline: {} harmony ticks per quarter note at 120 BPM",
+                "MIDI import baseline: {} harmony ticks per quarter note at 120 BPM (.fur files use module timing)",
                 ticks_per_quarter
             );
             for bank in &report.banks {
@@ -283,8 +283,8 @@ mod tests {
 
     #[test]
     fn rejects_removed_long_command_names() {
-        let err = Cli::try_parse_from(["harmony-midi", "extract-firmware", "fw.bin", "out"])
-            .unwrap_err();
+        let err =
+            Cli::try_parse_from(["harmony-midi", "extract-firmware", "fw.bin", "out"]).unwrap_err();
         let rendered = err.to_string();
         assert!(rendered.contains("unrecognized subcommand"));
         assert!(rendered.contains("extract"));

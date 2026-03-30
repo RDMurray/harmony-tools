@@ -6,7 +6,7 @@ Reverse-engineering, playback, and conversion tools for the Microminiatures Harm
 
 - Native/player core in C for Z80 + YM2149 playback and analysis
 - Browser player in `web/`
-- Rust `harmony-midi` tool for firmware extraction/build and Harmony<->MIDI conversion
+- Rust `harmony-midi` tool for firmware extraction/build and Harmony<->MIDI conversion, plus Furnace `.fur` import during `build`
 
 ## ROM Policy
 
@@ -32,6 +32,8 @@ harmony-midi to-midi extracted/code.bin extracted/song01.bin song01.mid
 harmony-midi to-harmony extracted/code.bin song01.mid song01.bin
 harmony-midi build extracted/ rebuilt.bin
 ```
+
+`build` accepts mixed `bankNN_songNN.mid` and `bankNN_songNN.fur` inputs in the same directory. A `.fur` file expands one subsong per Harmony slot, starting at the filename's bank/song and carrying into later slots and banks as needed.
 
 For full command help:
 

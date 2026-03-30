@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.1"
 midly = "0.5.3"

@@ -1,4 +1,7 @@
+mod furnace;
+
 use anyhow::{Context, Result, anyhow, bail};
+use furnace::{ParsedFurnaceModule, parse_furnace_bytes};
 use midly::{
     Arena, Format, Header, MetaMessage, MidiMessage, PitchBend, Smf, Timing, TrackEvent,
     TrackEventKind,
@@ -7,7 +10,7 @@ use midly::{
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const BANK_SIZE: usize = 0x4000;
 pub const SONGS_PER_BANK: usize = 16;
@@ -74,6 +77,23 @@ struct MidiImportInput {
 }
 
 #[derive(Clone, Debug)]
+struct FurnaceImportInput {
+    display_name: String,
+    module: ParsedFurnaceModule,
+}
+
+#[derive(Clone, Debug)]
+enum ImportedSongSource {
+    Midi { input: MidiImportInput },
+    Furnace { input: FurnaceImportInput },
+}
+
+#[derive(Clone, Debug)]
+struct PlacedSong {
+    stream: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 pub struct WarningCollector {
     warnings: Vec<String>,
     quantized_events: usize,
@@ -126,7 +146,7 @@ struct ActiveSegment {
 }
 
 #[derive(Clone, Debug)]
-struct MidiInterval {
+pub(crate) struct PitchInterval {
     start: u32,
     end: u32,
     pitch_value: f64,
@@ -283,7 +303,10 @@ pub fn build_firmware_from_dir_with_options(
         fs::read(&code_path).with_context(|| format!("reading {}", code_path.display()))?;
     validate_code_section(&original_code_section)?;
 
-    let mut discovered: BTreeMap<usize, BTreeMap<usize, PathBuf>> = BTreeMap::new();
+    let mut warnings = WarningCollector::new();
+    let mut discovered: BTreeMap<(usize, usize), ImportedSongSource> = BTreeMap::new();
+    let mut midi_inputs = Vec::new();
+    let mut furnace_inputs = Vec::new();
     for entry in
         fs::read_dir(input_dir).with_context(|| format!("reading {}", input_dir.display()))?
     {
@@ -292,100 +315,174 @@ pub fn build_firmware_from_dir_with_options(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if let Some(id) = parse_song_filename(name) {
-            discovered
-                .entry(id.bank_index)
-                .or_default()
-                .insert(id.song_index, path.clone());
+        if let Some((id, kind)) = parse_song_input_filename(name) {
+            let key = (id.bank_index, id.song_index);
+            if discovered.contains_key(&key) {
+                bail!(
+                    "multiple input files claim bank {:02} song {:02}",
+                    id.bank_index + 1,
+                    id.song_index + 1
+                );
+            }
+            match kind {
+                SongInputKind::Midi => {
+                    let input = MidiImportInput {
+                        display_name: path.display().to_string(),
+                        bytes: fs::read(&path)
+                            .with_context(|| format!("reading {}", path.display()))?,
+                    };
+                    midi_inputs.push(input.clone());
+                    discovered.insert(key, ImportedSongSource::Midi { input });
+                }
+                SongInputKind::Furnace => {
+                    let bytes =
+                        fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                    let mut parse_warnings = WarningCollector::new();
+                    let module = parse_furnace_bytes(
+                        &path.display().to_string(),
+                        &bytes,
+                        &mut parse_warnings,
+                    )
+                    .with_context(|| format!("decoding {}", path.display()))?;
+                    for warning in parse_warnings.into_vec() {
+                        warnings.warn(format!("{}: {}", path.display(), warning));
+                    }
+                    let input = FurnaceImportInput {
+                        display_name: path.display().to_string(),
+                        module,
+                    };
+                    furnace_inputs.push(input.clone());
+                    discovered.insert(key, ImportedSongSource::Furnace { input });
+                }
+            }
         }
     }
 
     if discovered.is_empty() {
         bail!(
-            "no song MIDI files found in {} (expected names like bank01_song01.mid)",
+            "no song input files found in {} (expected names like bank01_song01.mid or bank01_song01.fur)",
             input_dir.display()
         );
     }
 
-    let mut midi_inputs = Vec::new();
-    for songs in discovered.values() {
-        for path in songs.values() {
-            midi_inputs.push(MidiImportInput {
-                display_name: path.display().to_string(),
-                bytes: fs::read(path).with_context(|| format!("reading {}", path.display()))?,
-            });
-        }
-    }
-
-    let mut banks: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
-    let mut warnings = WarningCollector::new();
     if let Some(volumes) = channel_volumes {
         write_channel_volumes(&mut original_code_section, volumes)?;
     }
-    let import_code_section =
-        maybe_upgrade_code_for_midi_import(&original_code_section, &midi_inputs, &mut warnings)?;
-    let max_bank = *discovered.keys().max().unwrap();
+    let import_code_section = maybe_upgrade_code_for_imports(
+        &original_code_section,
+        &midi_inputs,
+        &furnace_inputs,
+        &mut warnings,
+    )?;
+    let note_mapping = build_note_mapping(&import_code_section)?;
+    let song_data_start = import_code_section.len().max(DEFAULT_CODE_SECTION_LEN);
+    if song_data_start > BANK_SIZE {
+        bail!(
+            "song data start 0x{:04X} exceeds bank size",
+            song_data_start
+        );
+    }
+
+    let mut placed_songs: BTreeMap<usize, BTreeMap<usize, PlacedSong>> = BTreeMap::new();
+    let mut bank_data_usage = Vec::new();
     let mut global_fallback_stream: Option<Vec<u8>> = None;
-    for bank_index in 0..=max_bank {
-        let songs = discovered.get(&bank_index);
-        let mut bank_songs = Vec::with_capacity(SONGS_PER_BANK);
-        for song_index in 0..SONGS_PER_BANK {
-            let stream = match songs.and_then(|m| m.get(&song_index)) {
-                Some(path) => {
-                    let mut song_warnings = WarningCollector::new();
-                    let stream = midi_file_to_harmony_stream(
-                        &import_code_section,
-                        path,
-                        &mut song_warnings,
-                        ticks_per_quarter,
-                    )
-                    .with_context(|| format!("decoding {}", path.display()))?;
-                    let warning_prefix =
-                        format!("bank {:02} song {:02}: ", bank_index + 1, song_index + 1);
-                    for warning in song_warnings.into_vec() {
-                        warnings.warn(format!("{warning_prefix}{warning}"));
-                    }
+
+    for ((bank_index, song_index), source) in discovered {
+        let anchor = SongFileId {
+            bank_index,
+            song_index,
+        };
+        match source {
+            ImportedSongSource::Midi { input } => {
+                let mut song_warnings = WarningCollector::new();
+                let stream = midi_bytes_to_harmony_stream_with_ticks(
+                    &import_code_section,
+                    &input.bytes,
+                    &mut song_warnings,
+                    ticks_per_quarter,
+                )
+                .with_context(|| format!("decoding {}", input.display_name))?;
+                for warning in song_warnings.into_vec() {
+                    warnings.warn(format!(
+                        "bank {:02} song {:02}: {}",
+                        anchor.bank_index + 1,
+                        anchor.song_index + 1,
+                        warning
+                    ));
+                }
+                if global_fallback_stream.is_none() {
+                    global_fallback_stream = Some(stream.clone());
+                }
+                place_imported_song(
+                    &mut placed_songs,
+                    &mut bank_data_usage,
+                    anchor,
+                    PlacedSong { stream },
+                    song_data_start,
+                    false,
+                    &input.display_name,
+                )?;
+            }
+            ImportedSongSource::Furnace { input } => {
+                let mut next_slot = anchor.clone();
+                for (subsong_index, subsong) in input.module.subsongs.iter().enumerate() {
+                    let segments =
+                        build_voice_segments_from_intervals(&subsong.voices, &note_mapping);
+                    let stream = encode_voice_segments_to_stream(&segments);
                     if global_fallback_stream.is_none() {
                         global_fallback_stream = Some(stream.clone());
                     }
-                    Some(stream)
+                    if subsong_index > 0 {
+                        next_slot = next_song_slot(&next_slot);
+                    }
+                    let actual_slot = place_imported_song(
+                        &mut placed_songs,
+                        &mut bank_data_usage,
+                        next_slot,
+                        PlacedSong { stream },
+                        song_data_start,
+                        subsong_index > 0,
+                        &subsong.display_name,
+                    )?;
+                    next_slot = actual_slot;
                 }
-                None => None,
-            };
-            bank_songs.push(stream);
+            }
         }
-        banks.push(bank_songs);
     }
 
-    let mut firmware = Vec::with_capacity(banks.len() * BANK_SIZE);
-    let mut bank_stats = Vec::with_capacity(banks.len());
+    let max_bank = placed_songs.keys().next_back().copied().unwrap_or(0);
+    let mut firmware = Vec::with_capacity((max_bank + 1) * BANK_SIZE);
+    let mut bank_stats = Vec::with_capacity(max_bank + 1);
     let fallback_stream = global_fallback_stream.ok_or_else(|| {
         anyhow!(
-            "no decodable song MIDI files found in {}",
+            "no decodable song input files found in {}",
             input_dir.display()
         )
     })?;
-    for (bank_index, bank_songs) in banks.iter().enumerate() {
+    for bank_index in 0..=max_bank {
+        let bank_songs = placed_songs.get(&bank_index);
         let mut bank = vec![0xFFu8; BANK_SIZE];
         bank[..import_code_section.len()].copy_from_slice(&import_code_section);
-        let song_data_start = import_code_section.len().max(DEFAULT_CODE_SECTION_LEN);
         let mut cursor = song_data_start;
-        if song_data_start > BANK_SIZE {
-            bail!(
-                "song data start 0x{:04X} exceeds bank size",
-                song_data_start
-            );
-        }
-        let representative_index = bank_songs.iter().position(|song| song.is_some());
+        let representative_index = (0..SONGS_PER_BANK).rfind(|&song_index| {
+            bank_songs
+                .and_then(|songs| songs.get(&song_index))
+                .is_some()
+        });
         let representative_stream = representative_index
-            .and_then(|idx| bank_songs[idx].as_ref())
+            .and_then(|idx| bank_songs.and_then(|songs| songs.get(&idx)))
+            .map(|song| &song.stream)
             .unwrap_or(&fallback_stream);
         if representative_index.is_none() {
             warnings.warn(format!(
-                "bank {} has no MIDI songs; all 16 pointers will alias a copied fallback song",
+                "bank {} has no imported songs; all 16 pointers will alias a copied fallback song",
                 bank_index + 1
             ));
-        } else if bank_songs.iter().any(|song| song.is_none()) {
+        } else if (0..SONGS_PER_BANK).any(|song_index| {
+            bank_songs
+                .and_then(|songs| songs.get(&song_index))
+                .is_none()
+        }) {
             warnings.warn(format!(
                 "bank {} has missing song slots; absent entries will alias song {}",
                 bank_index + 1,
@@ -395,7 +492,8 @@ pub fn build_firmware_from_dir_with_options(
 
         let mut representative_ptr: Option<u16> = None;
         let mut unique_song_count = 0usize;
-        for (song_index, song_stream) in bank_songs.iter().enumerate() {
+        for song_index in 0..SONGS_PER_BANK {
+            let song_stream = bank_songs.and_then(|songs| songs.get(&song_index));
             let ptr = if song_stream.is_none() || representative_index == Some(song_index) {
                 if representative_ptr.is_none() {
                     if cursor + representative_stream.len() > BANK_SIZE {
@@ -414,7 +512,7 @@ pub fn build_firmware_from_dir_with_options(
                 }
                 representative_ptr.unwrap()
             } else {
-                let song_stream = song_stream.as_ref().unwrap();
+                let song_stream = &song_stream.unwrap().stream;
                 if cursor + song_stream.len() > BANK_SIZE {
                     bail!(
                         "bank overflow while placing song {}: need {} more bytes with {} bytes free",
@@ -451,6 +549,98 @@ pub fn build_firmware_from_dir_with_options(
         bank_capacity_bytes: BANK_SIZE,
         banks: bank_stats,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SongInputKind {
+    Midi,
+    Furnace,
+}
+
+fn next_song_slot(current: &SongFileId) -> SongFileId {
+    if current.song_index + 1 >= SONGS_PER_BANK {
+        SongFileId {
+            bank_index: current.bank_index + 1,
+            song_index: 0,
+        }
+    } else {
+        SongFileId {
+            bank_index: current.bank_index,
+            song_index: current.song_index + 1,
+        }
+    }
+}
+
+fn ensure_bank_usage(bank_data_usage: &mut Vec<usize>, bank_index: usize, song_data_start: usize) {
+    if bank_data_usage.len() <= bank_index {
+        bank_data_usage.resize(bank_index + 1, song_data_start);
+    }
+}
+
+fn place_imported_song(
+    placed_songs: &mut BTreeMap<usize, BTreeMap<usize, PlacedSong>>,
+    bank_data_usage: &mut Vec<usize>,
+    requested_slot: SongFileId,
+    placed_song: PlacedSong,
+    song_data_start: usize,
+    allow_bank_carry: bool,
+    source_name: &str,
+) -> Result<SongFileId> {
+    if song_data_start + placed_song.stream.len() > BANK_SIZE {
+        bail!(
+            "{} needs {} bytes of song data but only {} bytes are available in an empty bank",
+            source_name,
+            placed_song.stream.len(),
+            BANK_SIZE.saturating_sub(song_data_start)
+        );
+    }
+
+    let mut slot = requested_slot;
+    loop {
+        ensure_bank_usage(bank_data_usage, slot.bank_index, song_data_start);
+
+        if bank_data_usage[slot.bank_index] + placed_song.stream.len() > BANK_SIZE {
+            if !allow_bank_carry {
+                bail!(
+                    "{} does not fit in bank {:02}; need {} more bytes with {} bytes free",
+                    source_name,
+                    slot.bank_index + 1,
+                    placed_song.stream.len(),
+                    BANK_SIZE.saturating_sub(bank_data_usage[slot.bank_index])
+                );
+            }
+            slot = SongFileId {
+                bank_index: slot.bank_index + 1,
+                song_index: 0,
+            };
+            if placed_songs
+                .get(&slot.bank_index)
+                .and_then(|songs| songs.get(&slot.song_index))
+                .is_some()
+            {
+                bail!(
+                    "{} cannot carry into bank {:02} song {:02} because that slot is already occupied",
+                    source_name,
+                    slot.bank_index + 1,
+                    slot.song_index + 1
+                );
+            }
+            continue;
+        }
+
+        let bank = placed_songs.entry(slot.bank_index).or_default();
+        if bank.contains_key(&slot.song_index) {
+            bail!(
+                "{} conflicts with an existing assignment at bank {:02} song {:02}",
+                source_name,
+                slot.bank_index + 1,
+                slot.song_index + 1
+            );
+        }
+        bank_data_usage[slot.bank_index] += placed_song.stream.len();
+        bank.insert(slot.song_index, placed_song);
+        return Ok(slot);
+    }
 }
 
 pub fn harmony_song_to_midi_file(
@@ -593,10 +783,20 @@ fn parse_pointer_table(bank: &[u8]) -> Result<Vec<u16>> {
     Ok(pointers)
 }
 
-fn parse_song_filename(name: &str) -> Option<SongFileId> {
-    let stem = name
+fn parse_song_input_filename(name: &str) -> Option<(SongFileId, SongInputKind)> {
+    let (stem, kind) = if let Some(stem) = name
         .strip_suffix(".mid")
-        .or_else(|| name.strip_suffix(".MID"))?;
+        .or_else(|| name.strip_suffix(".MID"))
+    {
+        (stem, SongInputKind::Midi)
+    } else if let Some(stem) = name
+        .strip_suffix(".fur")
+        .or_else(|| name.strip_suffix(".FUR"))
+    {
+        (stem, SongInputKind::Furnace)
+    } else {
+        return None;
+    };
     let (bank_part, song_part) = stem.split_once('_')?;
     let bank = bank_part
         .strip_prefix("bank")
@@ -615,6 +815,17 @@ fn parse_song_filename(name: &str) -> Option<SongFileId> {
         bank_index: bank - 1,
         song_index: song - 1,
     })
+    .map(|id| (id, kind))
+}
+
+#[cfg(test)]
+fn parse_song_filename(name: &str) -> Option<SongFileId> {
+    let (id, kind) = parse_song_input_filename(name)?;
+    if kind == SongInputKind::Midi {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 fn validate_code_section(code_section: &[u8]) -> Result<()> {
@@ -705,9 +916,10 @@ fn build_complete_midi_note_table() -> [u16; 128] {
     table
 }
 
-fn maybe_upgrade_code_for_midi_import(
+fn maybe_upgrade_code_for_imports(
     code: &[u8],
     midi_inputs: &[MidiImportInput],
+    furnace_inputs: &[FurnaceImportInput],
     warnings: &mut WarningCollector,
 ) -> Result<Vec<u8>> {
     let note_mapping = build_note_mapping(code)?;
@@ -726,6 +938,22 @@ fn maybe_upgrade_code_for_midi_import(
     }
 
     if !requires_full_table {
+        for furnace in furnace_inputs {
+            let Some((source_min, source_max)) = furnace.module.pitch_bounds else {
+                continue;
+            };
+            if source_min < min_pitch || source_max > max_pitch {
+                warnings.warn(format!(
+                    "rewriting note table to a full 128-note MIDI table because {} uses notes outside the current table range",
+                    furnace.display_name
+                ));
+                requires_full_table = true;
+                break;
+            }
+        }
+    }
+
+    if !requires_full_table {
         return Ok(code.to_vec());
     }
 
@@ -733,6 +961,14 @@ fn maybe_upgrade_code_for_midi_import(
     let table = build_complete_midi_note_table();
     write_note_table(&mut upgraded, &table)?;
     Ok(upgraded)
+}
+
+fn maybe_upgrade_code_for_midi_import(
+    code: &[u8],
+    midi_inputs: &[MidiImportInput],
+    warnings: &mut WarningCollector,
+) -> Result<Vec<u8>> {
+    maybe_upgrade_code_for_imports(code, midi_inputs, &[], warnings)
 }
 
 fn note_mapping_pitch_bounds(note_mapping: &NoteMapping) -> Result<(f64, f64)> {
@@ -932,17 +1168,6 @@ fn push_pitch_bend_range_setup(track: &mut TrackBuild, channel: u8) {
     }
 }
 
-fn midi_file_to_harmony_stream(
-    code: &[u8],
-    midi_path: &Path,
-    warnings: &mut WarningCollector,
-    ticks_per_quarter: u16,
-) -> Result<Vec<u8>> {
-    let midi_bytes =
-        fs::read(midi_path).with_context(|| format!("reading {}", midi_path.display()))?;
-    midi_bytes_to_harmony_stream_with_ticks(code, &midi_bytes, warnings, ticks_per_quarter)
-}
-
 fn midi_velocity_for_volume(volume: u8) -> u8 {
     (((u16::from(volume) * 127) + 7) / 15) as u8
 }
@@ -1092,7 +1317,7 @@ fn collect_channel_intervals(
     smf: &Smf<'_>,
     warnings: &mut WarningCollector,
     ticks_per_quarter: u16,
-) -> Result<[Vec<MidiInterval>; 3]> {
+) -> Result<[Vec<PitchInterval>; 3]> {
     let timing_map = MidiTimingMap::from_smf(smf)?;
     let mut events: [Vec<(u32, usize, CanonicalChannelEvent)>; 3] =
         [Vec::new(), Vec::new(), Vec::new()];
@@ -1153,7 +1378,7 @@ fn collect_channel_intervals(
         }
     }
 
-    let mut voices: [Vec<MidiInterval>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut voices: [Vec<PitchInterval>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (channel_index, channel_events) in events.iter_mut().enumerate() {
         channel_events.sort_by(|a, b| match a.0.cmp(&b.0) {
             Ordering::Equal => a.1.cmp(&b.1),
@@ -1174,7 +1399,7 @@ fn collect_channel_intervals(
                             ticks_per_quarter,
                         );
                         if start_q > previous_start_q {
-                            voices[channel_index].push(MidiInterval {
+                            voices[channel_index].push(PitchInterval {
                                 start: previous_start_q,
                                 end: start_q,
                                 pitch_value: previous_pitch,
@@ -1209,7 +1434,7 @@ fn collect_channel_intervals(
                         ));
                         end_q = start_q + 1;
                     }
-                    voices[channel_index].push(MidiInterval {
+                    voices[channel_index].push(PitchInterval {
                         start: start_q,
                         end: end_q,
                         pitch_value,
@@ -1223,7 +1448,7 @@ fn collect_channel_intervals(
             if end_q <= start_q {
                 end_q = start_q + 1;
             }
-            voices[channel_index].push(MidiInterval {
+            voices[channel_index].push(PitchInterval {
                 start: start_q,
                 end: end_q,
                 pitch_value,
@@ -1309,7 +1534,7 @@ impl MidiTimingMap {
 }
 
 fn build_voice_segments_from_intervals(
-    voices: &[Vec<MidiInterval>; 3],
+    voices: &[Vec<PitchInterval>; 3],
     note_mapping: &NoteMapping,
 ) -> [Vec<HarmonySegment>; 3] {
     let song_end = voices
@@ -1537,6 +1762,11 @@ fn record_to_segment(record: &HarmonyRecord) -> HarmonySegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::furnace::parse_furnace_bytes;
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_code() -> Vec<u8> {
@@ -1765,6 +1995,282 @@ mod tests {
                 ],
             ],
         )
+    }
+
+    #[derive(Clone)]
+    struct TestFurnaceSubsong {
+        name: &'static str,
+        ticks_per_second: f32,
+        speed_pattern: Vec<u16>,
+        pattern_length: u16,
+        orders: Vec<u8>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TestFurnaceRow {
+        note: Option<u8>,
+        volume: Option<u8>,
+        effect0: Option<(u8, u8)>,
+    }
+
+    #[derive(Clone)]
+    struct TestFurnacePattern {
+        subsong: u8,
+        channel: u16,
+        index: u16,
+        rows: Vec<(usize, TestFurnaceRow)>,
+    }
+
+    fn push_c_string(target: &mut Vec<u8>, value: &str) {
+        target.extend_from_slice(value.as_bytes());
+        target.push(0);
+    }
+
+    fn build_test_block(id: &[u8; 4], body: Vec<u8>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn build_test_pattern_block(pattern: &TestFurnacePattern) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(pattern.subsong);
+        body.push(0);
+        body.extend_from_slice(&pattern.channel.to_le_bytes());
+        body.extend_from_slice(&pattern.index.to_le_bytes());
+        push_c_string(&mut body, "");
+
+        let mut rows = pattern.rows.clone();
+        rows.sort_by_key(|(row, _)| *row);
+        let mut cursor = 0usize;
+        for (row_index, row) in rows {
+            while cursor < row_index {
+                let gap = row_index - cursor;
+                if gap >= 2 {
+                    let skip = (gap - 2).min(0x7F);
+                    body.push(0x80 | skip as u8);
+                    cursor += skip + 2;
+                } else {
+                    body.push(0x00);
+                    cursor += 1;
+                }
+            }
+
+            let mut control = 0u8;
+            if row.note.is_some() {
+                control |= 0x01;
+            }
+            if row.volume.is_some() {
+                control |= 0x04;
+            }
+            if row.effect0.is_some() {
+                control |= 0x08 | 0x10;
+            }
+            body.push(control);
+            if let Some(note) = row.note {
+                body.push(note);
+            }
+            if let Some(volume) = row.volume {
+                body.push(volume);
+            }
+            if let Some((fx, fx_val)) = row.effect0 {
+                body.push(fx);
+                body.push(fx_val);
+            }
+            cursor += 1;
+        }
+        body.push(0xFF);
+        build_test_block(b"PATN", body)
+    }
+
+    fn build_test_subsong_block(total_channels: usize, subsong: &TestFurnaceSubsong) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&subsong.ticks_per_second.to_le_bytes());
+        body.push(1);
+        body.push(1);
+        body.extend_from_slice(&subsong.pattern_length.to_le_bytes());
+        body.extend_from_slice(
+            &(subsong.orders.len() as u16 / total_channels as u16).to_le_bytes(),
+        );
+        body.push(4);
+        body.push(16);
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.push(subsong.speed_pattern.len() as u8);
+        for index in 0..16 {
+            let speed = subsong.speed_pattern.get(index).copied().unwrap_or(1);
+            body.extend_from_slice(&speed.to_le_bytes());
+        }
+        push_c_string(&mut body, subsong.name);
+        push_c_string(&mut body, "");
+        body.extend_from_slice(&subsong.orders);
+        body.extend(std::iter::repeat_n(0u8, total_channels));
+        body.extend(std::iter::repeat_n(0u8, total_channels));
+        body.extend(std::iter::repeat_n(0u8, total_channels));
+        for _ in 0..total_channels {
+            push_c_string(&mut body, "");
+        }
+        for _ in 0..total_channels {
+            push_c_string(&mut body, "");
+        }
+        body.extend(std::iter::repeat_n(0u8, total_channels * 4));
+        build_test_block(b"SNG2", body)
+    }
+
+    fn build_test_inf2_block(
+        total_channels: u16,
+        chips: &[(u16, u16)],
+        subsong_pointers: &[u32],
+        pattern_pointers: &[u32],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for value in ["song", "author", "system", "album", "", "", "", ""] {
+            push_c_string(&mut body, value);
+        }
+        body.extend_from_slice(&440.0f32.to_le_bytes());
+        body.push(0);
+        body.extend_from_slice(&1.0f32.to_le_bytes());
+        body.extend_from_slice(&total_channels.to_le_bytes());
+        body.extend_from_slice(&(chips.len() as u16).to_le_bytes());
+        for &(chip_id, channel_count) in chips {
+            body.extend_from_slice(&chip_id.to_le_bytes());
+            body.extend_from_slice(&channel_count.to_le_bytes());
+            body.extend_from_slice(&1.0f32.to_le_bytes());
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(1);
+
+        body.push(0x01);
+        body.extend_from_slice(&(subsong_pointers.len() as u32).to_le_bytes());
+        for pointer in subsong_pointers {
+            body.extend_from_slice(&pointer.to_le_bytes());
+        }
+        body.push(0x07);
+        body.extend_from_slice(&(pattern_pointers.len() as u32).to_le_bytes());
+        for pointer in pattern_pointers {
+            body.extend_from_slice(&pointer.to_le_bytes());
+        }
+        body.push(0);
+
+        build_test_block(b"INF2", body)
+    }
+
+    fn build_test_furnace_module(
+        chips: &[(u16, u16)],
+        subsongs: &[TestFurnaceSubsong],
+        patterns: &[TestFurnacePattern],
+    ) -> Vec<u8> {
+        let total_channels: u16 = chips.iter().map(|(_, channels)| *channels).sum();
+        let subsong_blocks: Vec<Vec<u8>> = subsongs
+            .iter()
+            .map(|subsong| build_test_subsong_block(total_channels as usize, subsong))
+            .collect();
+        let pattern_blocks: Vec<Vec<u8>> = patterns.iter().map(build_test_pattern_block).collect();
+
+        let placeholder_info = build_test_inf2_block(
+            total_channels,
+            chips,
+            &vec![0; subsong_blocks.len()],
+            &vec![0; pattern_blocks.len()],
+        );
+        let mut next_ptr = 32 + placeholder_info.len();
+        let mut subsong_pointers = Vec::with_capacity(subsong_blocks.len());
+        for block in &subsong_blocks {
+            subsong_pointers.push(next_ptr as u32);
+            next_ptr += block.len();
+        }
+        let mut pattern_pointers = Vec::with_capacity(pattern_blocks.len());
+        for block in &pattern_blocks {
+            pattern_pointers.push(next_ptr as u32);
+            next_ptr += block.len();
+        }
+
+        let info_block =
+            build_test_inf2_block(total_channels, chips, &subsong_pointers, &pattern_pointers);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"-Furnace module-");
+        out.extend_from_slice(&240u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&32u32.to_le_bytes());
+        out.extend_from_slice(&[0u8; 8]);
+        out.extend_from_slice(&info_block);
+        for block in subsong_blocks {
+            out.extend_from_slice(&block);
+        }
+        for block in pattern_blocks {
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+
+    fn compress_zlib(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn simple_ay_furnace_subsong(
+        name: &'static str,
+        total_channels: usize,
+        channel_offset: usize,
+        note_a: u8,
+        note_b: u8,
+        note_c: u8,
+    ) -> (TestFurnaceSubsong, Vec<TestFurnacePattern>) {
+        let mut orders = vec![0u8; total_channels];
+        orders[channel_offset] = 0;
+        orders[channel_offset + 1] = 0;
+        orders[channel_offset + 2] = 0;
+        let subsong = TestFurnaceSubsong {
+            name,
+            ticks_per_second: 60.0,
+            speed_pattern: vec![6],
+            pattern_length: 2,
+            orders,
+        };
+        let patterns = vec![
+            TestFurnacePattern {
+                subsong: 0,
+                channel: channel_offset as u16,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(note_a),
+                        ..Default::default()
+                    },
+                )],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: (channel_offset + 1) as u16,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(note_b),
+                        ..Default::default()
+                    },
+                )],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: (channel_offset + 2) as u16,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(note_c),
+                        ..Default::default()
+                    },
+                )],
+            },
+        ];
+        (subsong, patterns)
     }
 
     #[test]
@@ -2073,10 +2579,12 @@ mod tests {
         assert_eq!(report.banks.len(), 2);
         let rebuilt = parse_firmware(&rebuilt_path).unwrap();
         assert_eq!(rebuilt.banks.len(), 2);
-        assert!(rebuilt
-            .banks
-            .iter()
-            .all(|bank| bank.songs.len() == SONGS_PER_BANK));
+        assert!(
+            rebuilt
+                .banks
+                .iter()
+                .all(|bank| bank.songs.len() == SONGS_PER_BANK)
+        );
 
         let _ = fs::remove_dir_all(&extract_dir);
         let _ = fs::remove_file(&rebuilt_path);
@@ -2299,6 +2807,230 @@ mod tests {
     }
 
     #[test]
+    fn furnace_parser_accepts_zlib_and_maps_ay_offset() {
+        let (subsong, patterns) = simple_ay_furnace_subsong("offset", 7, 4, 108, 112, 115);
+        let module = build_test_furnace_module(&[(0x03, 4), (0x80, 3)], &[subsong], &patterns);
+        let compressed = compress_zlib(&module);
+
+        let parsed_raw =
+            parse_furnace_bytes("offset.fur", &module, &mut WarningCollector::new()).unwrap();
+        let parsed_zlib =
+            parse_furnace_bytes("offset.fur", &compressed, &mut WarningCollector::new()).unwrap();
+
+        assert_eq!(parsed_raw.subsongs.len(), 1);
+        assert_eq!(parsed_zlib.subsongs.len(), 1);
+        assert_eq!(parsed_raw.subsongs[0].voices[0][0].pitch_value, 60.0);
+        assert_eq!(parsed_raw.subsongs[0].voices[1][0].pitch_value, 64.0);
+        assert_eq!(parsed_raw.subsongs[0].voices[2][0].pitch_value, 67.0);
+        assert_eq!(parsed_zlib.pitch_bounds, Some((60.0, 67.0)));
+    }
+
+    #[test]
+    fn build_firmware_accepts_mixed_mid_and_fur_inputs() {
+        let input_dir = temp_test_dir("mixed-build-input");
+        let output_path = temp_test_dir("mixed-build-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+
+        let (subsong, patterns) = simple_ay_furnace_subsong("mix", 3, 0, 108, 112, 115);
+        let fur = build_test_furnace_module(&[(0x80, 3)], &[subsong], &patterns);
+        fs::write(input_dir.join("bank01_song01.fur"), fur).unwrap();
+        fs::write(
+            input_dir.join("bank01_song02.mid"),
+            single_note_midi_bytes(60, 8, HARMONY_TICKS_PER_QUARTER),
+        )
+        .unwrap();
+
+        let report = build_firmware_from_dir(&input_dir, &output_path).unwrap();
+        assert_eq!(report.banks.len(), 1);
+        assert_eq!(report.banks[0].unique_song_count, 2);
+
+        let firmware = fs::read(&output_path).unwrap();
+        let pointers = parse_pointer_table(&firmware[..BANK_SIZE]).unwrap();
+        assert_ne!(pointers[0], pointers[1]);
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn furnace_multisong_conflicts_with_explicit_next_slot() {
+        let input_dir = temp_test_dir("fur-conflict-input");
+        let output_path = temp_test_dir("fur-conflict-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+
+        let total_channels = 3usize;
+        let mut patterns = Vec::new();
+        let mut subsongs = Vec::new();
+        for subsong_index in 0..2u8 {
+            let mut orders = vec![0u8; total_channels];
+            orders[0] = subsong_index;
+            orders[1] = subsong_index;
+            orders[2] = subsong_index;
+            subsongs.push(TestFurnaceSubsong {
+                name: if subsong_index == 0 {
+                    "first"
+                } else {
+                    "second"
+                },
+                ticks_per_second: 60.0,
+                speed_pattern: vec![6],
+                pattern_length: 2,
+                orders,
+            });
+            for channel in 0..3u16 {
+                patterns.push(TestFurnacePattern {
+                    subsong: subsong_index,
+                    channel,
+                    index: subsong_index as u16,
+                    rows: vec![(
+                        0,
+                        TestFurnaceRow {
+                            note: Some(108 + channel as u8),
+                            ..Default::default()
+                        },
+                    )],
+                });
+            }
+        }
+        let fur = build_test_furnace_module(&[(0x80, 3)], &subsongs, &patterns);
+        fs::write(input_dir.join("bank01_song01.fur"), fur).unwrap();
+        fs::write(
+            input_dir.join("bank01_song02.mid"),
+            single_note_midi_bytes(60, 8, HARMONY_TICKS_PER_QUARTER),
+        )
+        .unwrap();
+
+        let err = build_firmware_from_dir(&input_dir, &output_path).unwrap_err();
+        assert!(err.to_string().contains("bank 01 song 02"));
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn furnace_subsongs_carry_across_song_16() {
+        let input_dir = temp_test_dir("fur-carry-slot-input");
+        let output_path = temp_test_dir("fur-carry-slot-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+
+        let total_channels = 3usize;
+        let mut patterns = Vec::new();
+        let mut subsongs = Vec::new();
+        for subsong_index in 0..2u8 {
+            let mut orders = vec![0u8; total_channels];
+            orders[0] = subsong_index;
+            orders[1] = subsong_index;
+            orders[2] = subsong_index;
+            subsongs.push(TestFurnaceSubsong {
+                name: if subsong_index == 0 {
+                    "tail-a"
+                } else {
+                    "tail-b"
+                },
+                ticks_per_second: 60.0,
+                speed_pattern: vec![6],
+                pattern_length: 2,
+                orders,
+            });
+            for channel in 0..3u16 {
+                patterns.push(TestFurnacePattern {
+                    subsong: subsong_index,
+                    channel,
+                    index: subsong_index as u16,
+                    rows: vec![(
+                        0,
+                        TestFurnaceRow {
+                            note: Some(108 + channel as u8 + subsong_index),
+                            ..Default::default()
+                        },
+                    )],
+                });
+            }
+        }
+        let fur = build_test_furnace_module(&[(0x80, 3)], &subsongs, &patterns);
+        fs::write(input_dir.join("bank01_song16.fur"), fur).unwrap();
+
+        let report = build_firmware_from_dir(&input_dir, &output_path).unwrap();
+        assert_eq!(report.banks.len(), 2);
+        assert_eq!(report.banks[0].unique_song_count, 1);
+        assert_eq!(report.banks[1].unique_song_count, 1);
+
+        let firmware = fs::read(&output_path).unwrap();
+        let bank0 = &firmware[..BANK_SIZE];
+        let bank1 = &firmware[BANK_SIZE..2 * BANK_SIZE];
+        let pointers0 = parse_pointer_table(bank0).unwrap();
+        let pointers1 = parse_pointer_table(bank1).unwrap();
+        let song0 = &bank0[usize::from(pointers0[15])..];
+        let song1 = &bank1[usize::from(pointers1[0])..];
+        let voices0 = decode_stream_to_voice_segments(
+            &song0[..song0.iter().position(|&b| b == 0xFF).unwrap() + 1],
+        )
+        .unwrap();
+        let voices1 = decode_stream_to_voice_segments(
+            &song1[..song1.iter().position(|&b| b == 0xFF).unwrap() + 1],
+        )
+        .unwrap();
+        assert_ne!(voices0[0][0].idx, voices1[0][0].idx);
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn furnace_subsongs_carry_when_bank_data_fills() {
+        let input_dir = temp_test_dir("fur-carry-bytes-input");
+        let output_path = temp_test_dir("fur-carry-bytes-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+
+        let mut subsongs = Vec::new();
+        let mut patterns = Vec::new();
+        for subsong_index in 0..12u8 {
+            let mut orders = vec![0u8; 3];
+            orders[0] = subsong_index;
+            orders[1] = subsong_index;
+            orders[2] = subsong_index;
+            subsongs.push(TestFurnaceSubsong {
+                name: "long",
+                ticks_per_second: 60.0,
+                speed_pattern: vec![1],
+                pattern_length: 256,
+                orders,
+            });
+            for channel in 0..3u16 {
+                let mut rows = Vec::new();
+                for row in 0..256usize {
+                    rows.push((
+                        row,
+                        TestFurnaceRow {
+                            note: Some(108 + ((row + channel as usize) % 12) as u8),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                patterns.push(TestFurnacePattern {
+                    subsong: subsong_index,
+                    channel,
+                    index: subsong_index as u16,
+                    rows,
+                });
+            }
+        }
+        let fur = build_test_furnace_module(&[(0x80, 3)], &subsongs, &patterns);
+        fs::write(input_dir.join("bank01_song01.fur"), fur).unwrap();
+
+        let report = build_firmware_from_dir(&input_dir, &output_path).unwrap();
+        assert!(report.banks.len() >= 2);
+        assert!(report.banks[0].unique_song_count < 12);
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
     fn parser_accepts_mixed_case_and_no_leading_zero_filenames() {
         assert_eq!(
             parse_song_filename("BANK2_SONG8.mid"),
@@ -2320,6 +3052,16 @@ mod tests {
                 bank_index: 1,
                 song_index: 7
             })
+        );
+        assert_eq!(
+            parse_song_input_filename("bank2_song8.fur"),
+            Some((
+                SongFileId {
+                    bank_index: 1,
+                    song_index: 7
+                },
+                SongInputKind::Furnace
+            ))
         );
     }
 }
