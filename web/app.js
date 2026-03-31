@@ -19,6 +19,8 @@ const els = {
   mixStemBtn: document.getElementById("mixStemBtn"),
   ymResampledBtn: document.getElementById("ymResampledBtn"),
   ymDirectBtn: document.getElementById("ymDirectBtn"),
+  ymDriverMameBtn: document.getElementById("ymDriverMameBtn"),
+  ymDriverFurnaceBtn: document.getElementById("ymDriverFurnaceBtn"),
 
   chALevel: document.getElementById("chALevel"),
   chBLevel: document.getElementById("chBLevel"),
@@ -72,7 +74,8 @@ const CONTROL_IDX = {
   mixMode: 15,
   cpuHz: 16,
   ymHz: 17,
-  ymRenderMode: 18
+  ymRenderMode: 18,
+  ymBackend: 19
 };
 
 const DEFAULT_CPU_HZ = 2000000;
@@ -104,6 +107,7 @@ let currentMixMode = 1;
 let currentCpuHzUi = DEFAULT_CPU_HZ;
 let currentYmHzUi = DEFAULT_YM_HZ;
 let currentYmRenderMode = 1;
+let currentYmBackend = 0;
 
 function setPlayEnabled(enabled) {
   if (els.playPauseBtn) {
@@ -241,7 +245,8 @@ function readControls(runningOverride) {
     mixMode: currentMixMode,
     cpuHz: readCpuHzFromUi(),
     ymHz: readYmHzFromUi(),
-    ymRenderMode: currentYmRenderMode
+    ymRenderMode: currentYmRenderMode,
+    ymBackend: currentYmBackend
   };
 }
 
@@ -297,6 +302,12 @@ function renderControlState() {
   }
   if (els.ymDirectBtn) {
     els.ymDirectBtn.classList.toggle("active", currentYmRenderMode === 0);
+  }
+  if (els.ymDriverMameBtn) {
+    els.ymDriverMameBtn.classList.toggle("active", currentYmBackend === 0);
+  }
+  if (els.ymDriverFurnaceBtn) {
+    els.ymDriverFurnaceBtn.classList.toggle("active", currentYmBackend === 1);
   }
 
   if (els.chALevelValue && els.chALevel) {
@@ -359,6 +370,7 @@ function writeControlBlock(values, markDirty = true) {
   Atomics.store(controlU32, CONTROL_IDX.cpuHz, values.cpuHz >>> 0);
   Atomics.store(controlU32, CONTROL_IDX.ymHz, values.ymHz >>> 0);
   Atomics.store(control, CONTROL_IDX.ymRenderMode, values.ymRenderMode);
+  Atomics.store(control, CONTROL_IDX.ymBackend, values.ymBackend);
   if (markDirty) {
     Atomics.store(control, CONTROL_IDX.dirty, 1);
   }
@@ -596,6 +608,10 @@ async function ensureAudio() {
         currentYmRenderMode = msg.status.ymRenderMode === 0 ? 0 : 1;
         renderControlState();
       }
+      if (typeof msg.status.ymBackend === "number" && msg.status.ymBackend !== currentYmBackend) {
+        currentYmBackend = msg.status.ymBackend === 1 ? 1 : 0;
+        renderControlState();
+      }
       if (typeof msg.status.cpuHz === "number" && msg.status.cpuHz > 0 && document.activeElement !== els.cpuFreqInput) {
         syncCpuInputFromHz(msg.status.cpuHz);
       }
@@ -818,6 +834,14 @@ function wireEvents() {
   });
   els.ymDirectBtn.addEventListener("click", () => {
     currentYmRenderMode = 0;
+    instantApply();
+  });
+  els.ymDriverMameBtn.addEventListener("click", () => {
+    currentYmBackend = 0;
+    instantApply();
+  });
+  els.ymDriverFurnaceBtn.addEventListener("click", () => {
+    currentYmBackend = 1;
     instantApply();
   });
 

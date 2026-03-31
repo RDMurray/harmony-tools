@@ -20,6 +20,10 @@
 typedef struct {
     YM2149Core ym;
     uint8_t input_port_1;
+    uint8_t suppress_psg_writes;
+    uint8_t psg_regs[16];
+    uint8_t psg_selected_reg;
+    uint8_t psg_active;
 } EmuUser;
 
 typedef struct {
@@ -36,14 +40,50 @@ static uint8_t emu_in_port(void *user, uint8_t port) {
     return 0;
 }
 
-static void emu_out_port(void *user, uint8_t port, uint8_t value) {
-    EmuUser *u = (EmuUser *)user;
+static void emu_shadow_write_address(EmuUser *u, uint8_t reg) {
+    u->psg_active = ((reg >> 4) == 0) ? 1u : 0u;
+    if (u->psg_active) {
+        u->psg_selected_reg = reg & 0x0Fu;
+    }
+}
+
+static void emu_shadow_write_data(EmuUser *u, uint8_t value) {
+    if (!u->psg_active) {
+        return;
+    }
+    u->psg_regs[u->psg_selected_reg] = value;
+}
+
+static void emu_apply_psg_write(EmuUser *u, uint8_t port, uint8_t value) {
     if (port == 0x03) {
+        emu_shadow_write_address(u, value);
         ym2149_write_address(&u->ym, value);
         return;
     }
     if (port == 0x02) {
+        emu_shadow_write_data(u, value);
         ym2149_write_data(&u->ym, value);
+    }
+}
+
+static double emu_tstates_to_samples(int sample_rate, int cpu_hz, uint32_t tstates) {
+    return ((double)tstates * (double)sample_rate) / (double)cpu_hz;
+}
+
+static void emu_out_port(void *user, uint8_t port, uint8_t value) {
+    EmuUser *u = (EmuUser *)user;
+    if (port == 0x03) {
+        emu_shadow_write_address(u, value);
+        if (!u->suppress_psg_writes) {
+            ym2149_write_address(&u->ym, value);
+        }
+        return;
+    }
+    if (port == 0x02) {
+        emu_shadow_write_data(u, value);
+        if (!u->suppress_psg_writes) {
+            ym2149_write_data(&u->ym, value);
+        }
     }
 }
 
@@ -105,11 +145,9 @@ static uint64_t fnv1a64_update(uint64_t h, const void *data, size_t n) {
 
 static uint64_t state_signature(const H32Board *board, const EmuUser *user) {
     uint64_t h = 1469598103934665603ULL;
-    const uint8_t *regs = ym2149_regs(&user->ym);
-    uint8_t selected = ym2149_selected_reg(&user->ym);
     h = fnv1a64_update(h, &board->ram[0x4000], 0x0D);
-    h = fnv1a64_update(h, regs, 14);
-    h = fnv1a64_update(h, &selected, 1);
+    h = fnv1a64_update(h, user->psg_regs, 14);
+    h = fnv1a64_update(h, &user->psg_selected_reg, 1);
     h = fnv1a64_update(h, &user->input_port_1, 1);
     if (h == 0) {
         h = 1;
@@ -165,8 +203,23 @@ static int hashset64_insert_or_seen(HashSet64 *hs, uint64_t key) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "Usage: %s <rom.bin> <out.wav> [song_index=0] [bank_index=0] [speed=3] [drums_on=1] [sample_rate=44100] [cpu_hz=2000000] [tail_ms=0] [max_seconds=600]\n",
+            "Usage: %s <rom.bin> <out.wav> [song_index=0] [bank_index=0] [speed=3] [drums_on=1] [sample_rate=44100] [cpu_hz=2000000] [tail_ms=0] [max_seconds=600] [ym_backend=mame|furnace]\n",
             argv0);
+}
+
+static int parse_backend_name(const char *text, uint8_t *out_backend) {
+    if (!text || !out_backend) {
+        return -1;
+    }
+    if (strcmp(text, "mame") == 0) {
+        *out_backend = YM2149_BACKEND_MAME;
+        return 0;
+    }
+    if (strcmp(text, "furnace") == 0) {
+        *out_backend = YM2149_BACKEND_FURNACE;
+        return 0;
+    }
+    return -1;
 }
 
 int main(int argc, char **argv) {
@@ -180,6 +233,7 @@ int main(int argc, char **argv) {
     int cpu_hz = 2000000;
     int tail_ms = 0;
     int max_seconds = 600;
+    uint8_t ym_backend = YM2149_BACKEND_MAME;
 
     FILE *rf = NULL;
     FILE *wf = NULL;
@@ -193,9 +247,13 @@ int main(int argc, char **argv) {
     uint32_t total_samples_max;
     uint32_t produced = 0;
     double sample_cursor = 0.0;
+    double tick_sample_position = 0.0;
     uint64_t steps = 0;
     int song_ended = 0;
     int loop_detected = 0;
+    H32StepTrace tick_trace;
+    uint32_t tick_write_index = 0;
+    int tick_trace_valid = 0;
 
     if (argc < 3) {
         usage(argv[0]);
@@ -238,6 +296,13 @@ int main(int argc, char **argv) {
     if (argc >= 11) {
         max_seconds = atoi(argv[10]);
     }
+    if (argc >= 12) {
+        if (parse_backend_name(argv[11], &ym_backend) != 0) {
+            fprintf(stderr, "Invalid YM backend: %s\n", argv[11]);
+            usage(argv[0]);
+            return 1;
+        }
+    }
 
     if (sample_rate <= 0 || cpu_hz <= 0 || song_index < 0 || song_index > 15 ||
         speed < 0 || speed > 3 || (drums_on != 0 && drums_on != 1) || tail_ms < 0 || max_seconds <= 0) {
@@ -250,7 +315,7 @@ int main(int argc, char **argv) {
     memset(&user, 0, sizeof(user));
     memset(&loop_set, 0, sizeof(loop_set));
 
-    ym2149_init(&user.ym, 2000000u, (uint32_t)sample_rate);
+    ym2149_init_backend(&user.ym, 2000000u, (uint32_t)sample_rate, ym_backend);
     /* Port 0x01 mapping from firmware:
      * bits 0..3 tune, bits 4..5 speed, bit 6 drums/noise mode.
      * drums_on=1 -> bit6=0, drums_on=0 -> bit6=1.
@@ -342,60 +407,89 @@ int main(int argc, char **argv) {
         (void)hashset64_insert_or_seen(&loop_set, state_signature(&board, &user));
     }
 
+    memset(&tick_trace, 0, sizeof(tick_trace));
+
     {
         int16_t last_sample = 0;
     while (produced < total_samples_max) {
-        uint32_t tstates = 0;
-        uint32_t target_samples;
-        uint32_t frame_samples;
-        int alive = h32_board_step_music_tick(&board, &tstates);
+        for (;;) {
+            if (tick_trace_valid) {
+                while (tick_write_index < tick_trace.write_count) {
+                    const H32PortWrite *write = &tick_trace.writes[tick_write_index];
+                    double write_offset = emu_tstates_to_samples(sample_rate, cpu_hz, write->tstate_end);
+                    if (write_offset > tick_sample_position) {
+                        break;
+                    }
+                    emu_apply_psg_write(&user, write->port, write->value);
+                    tick_write_index++;
+                }
+            }
 
-        steps++;
-
-        if (alive <= 0) {
-            song_ended = 1;
-            break;
-        }
-
-        if (loop_set_enabled) {
-            int seen = hashset64_insert_or_seen(&loop_set, state_signature(&board, &user));
-            if (seen == 1 && steps > 2048) {
-                loop_detected = 1;
+            if (sample_cursor > 0.0) {
                 break;
             }
-            if (seen < 0) {
-                loop_set_enabled = 0;
+
+            user.suppress_psg_writes = 1;
+            {
+                H32StepTrace trace;
+                double tick_samples;
+                int alive = h32_board_step_music_tick_trace(&board, &trace);
+                user.suppress_psg_writes = 0;
+
+                steps++;
+
+                if (alive <= 0) {
+                    song_ended = 1;
+                    goto render_done;
+                }
+
+                if (loop_set_enabled) {
+                    int seen = hashset64_insert_or_seen(&loop_set, state_signature(&board, &user));
+                    if (seen == 1 && steps > 2048) {
+                        loop_detected = 1;
+                        goto render_done;
+                    }
+                    if (seen < 0) {
+                        loop_set_enabled = 0;
+                    }
+                }
+
+                if (trace.total_tstates == 0) {
+                    trace.total_tstates = 1;
+                }
+
+                tick_samples = emu_tstates_to_samples(sample_rate, cpu_hz, trace.total_tstates);
+                sample_cursor += tick_samples;
+                if (sample_cursor <= 0.0) {
+                    uint32_t i;
+                    for (i = 0; i < trace.write_count; i++) {
+                        emu_apply_psg_write(&user, trace.writes[i].port, trace.writes[i].value);
+                    }
+                    tick_trace_valid = 0;
+                    continue;
+                }
+
+                tick_trace = trace;
+                tick_trace_valid = 1;
+                tick_write_index = 0;
+                tick_sample_position = tick_samples - sample_cursor;
+                if (tick_sample_position < 0.0) {
+                    tick_sample_position = 0.0;
+                }
             }
         }
 
-        if (tstates == 0) {
-            tstates = 1;
-        }
-
-        sample_cursor += ((double)tstates * (double)sample_rate) / (double)cpu_hz;
-        target_samples = (uint32_t)sample_cursor;
-        if (target_samples <= produced) {
-            target_samples = produced + 1;
-        }
-        frame_samples = target_samples - produced;
-
-        if (produced + frame_samples > total_samples_max) {
-            frame_samples = total_samples_max - produced;
-        }
-
-        while (frame_samples > 0) {
+        {
             int16_t s = ym_next_pcm16(&user.ym);
             write_u16le(wf, (uint16_t)s);
             last_sample = s;
-            frame_samples--;
-        }
-
-        produced = target_samples;
-        if (produced > total_samples_max) {
-            produced = total_samples_max;
+            produced++;
+            sample_cursor -= 1.0;
+            tick_sample_position += 1.0;
         }
     }
 
+render_done:
     if ((song_ended || loop_detected) && produced < total_samples_max) {
         uint32_t tail_samples = (uint32_t)(((uint64_t)tail_ms * (uint64_t)sample_rate) / 1000ULL);
         if (tail_samples > total_samples_max - produced) {
@@ -423,7 +517,7 @@ int main(int argc, char **argv) {
     h32_board_deinit(&board);
 
     fprintf(stderr,
-            "Wrote %s (%u samples, %.3f s, song %d, bank %u, speed=%d, drums_on=%d, %d Hz, cpu=%d Hz, in1=0x%02X, reason=%s).\n",
+            "Wrote %s (%u samples, %.3f s, song %d, bank %u, speed=%d, drums_on=%d, %d Hz, cpu=%d Hz, ym_backend=%s, in1=0x%02X, reason=%s).\n",
             wav_path,
             produced,
             (double)produced / (double)sample_rate,
@@ -433,6 +527,7 @@ int main(int argc, char **argv) {
             drums_on,
             sample_rate,
             cpu_hz,
+            ym2149_backend_name(ym_backend),
             user.input_port_1,
             song_ended ? "song_end" : (loop_detected ? "loop_detected" : "max_seconds"));
 

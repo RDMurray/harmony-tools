@@ -89,6 +89,12 @@ enum ImportedSongSource {
 }
 
 #[derive(Clone, Debug)]
+struct AutoDiscoveredInput {
+    file_name: String,
+    source: ImportedSongSource,
+}
+
+#[derive(Clone, Debug)]
 struct PlacedSong {
     stream: Vec<u8>,
 }
@@ -305,6 +311,7 @@ pub fn build_firmware_from_dir_with_options(
 
     let mut warnings = WarningCollector::new();
     let mut discovered: BTreeMap<(usize, usize), ImportedSongSource> = BTreeMap::new();
+    let mut auto_discovered = Vec::new();
     let mut midi_inputs = Vec::new();
     let mut furnace_inputs = Vec::new();
     for entry in
@@ -315,7 +322,16 @@ pub fn build_firmware_from_dir_with_options(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if let Some((id, kind)) = parse_song_input_filename(name) {
+        let Some(kind) = parse_song_input_kind(name) else {
+            continue;
+        };
+        let source = load_imported_song_source(&path, kind, &mut warnings)?;
+        match &source {
+            ImportedSongSource::Midi { input } => midi_inputs.push(input.clone()),
+            ImportedSongSource::Furnace { input } => furnace_inputs.push(input.clone()),
+        }
+
+        if let Some((id, _)) = parse_song_input_filename(name) {
             let key = (id.bank_index, id.song_index);
             if discovered.contains_key(&key) {
                 bail!(
@@ -324,43 +340,19 @@ pub fn build_firmware_from_dir_with_options(
                     id.song_index + 1
                 );
             }
-            match kind {
-                SongInputKind::Midi => {
-                    let input = MidiImportInput {
-                        display_name: path.display().to_string(),
-                        bytes: fs::read(&path)
-                            .with_context(|| format!("reading {}", path.display()))?,
-                    };
-                    midi_inputs.push(input.clone());
-                    discovered.insert(key, ImportedSongSource::Midi { input });
-                }
-                SongInputKind::Furnace => {
-                    let bytes =
-                        fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-                    let mut parse_warnings = WarningCollector::new();
-                    let module = parse_furnace_bytes(
-                        &path.display().to_string(),
-                        &bytes,
-                        &mut parse_warnings,
-                    )
-                    .with_context(|| format!("decoding {}", path.display()))?;
-                    for warning in parse_warnings.into_vec() {
-                        warnings.warn(format!("{}: {}", path.display(), warning));
-                    }
-                    let input = FurnaceImportInput {
-                        display_name: path.display().to_string(),
-                        module,
-                    };
-                    furnace_inputs.push(input.clone());
-                    discovered.insert(key, ImportedSongSource::Furnace { input });
-                }
-            }
+            discovered.insert(key, source);
+        } else {
+            auto_discovered.push(AutoDiscoveredInput {
+                file_name: name.to_string(),
+                source,
+            });
         }
     }
+    auto_discovered.sort_by(|a, b| a.file_name.cmp(&b.file_name));
 
-    if discovered.is_empty() {
+    if discovered.is_empty() && auto_discovered.is_empty() {
         bail!(
-            "no song input files found in {} (expected names like bank01_song01.mid or bank01_song01.fur)",
+            "no song input files found in {} (expected bankNN_songNN.mid/.fur or arbitrary .mid/.fur files)",
             input_dir.display()
         );
     }
@@ -444,6 +436,108 @@ pub fn build_firmware_from_dir_with_options(
                         subsong_index > 0,
                         &subsong.display_name,
                     )?;
+                    next_slot = actual_slot;
+                }
+            }
+        }
+    }
+
+    let first_auto_slot = SongFileId {
+        bank_index: 0,
+        song_index: 0,
+    };
+    for auto_input in auto_discovered {
+        match auto_input.source {
+            ImportedSongSource::Midi { input } => {
+                let mut song_warnings = WarningCollector::new();
+                let stream = midi_bytes_to_harmony_stream_with_ticks(
+                    &import_code_section,
+                    &input.bytes,
+                    &mut song_warnings,
+                    ticks_per_quarter,
+                )
+                .with_context(|| format!("decoding {}", input.display_name))?;
+                if global_fallback_stream.is_none() {
+                    global_fallback_stream = Some(stream.clone());
+                }
+                let requested_slot = find_auto_song_slot(
+                    &placed_songs,
+                    &mut bank_data_usage,
+                    first_auto_slot.clone(),
+                    stream.len(),
+                    song_data_start,
+                )?;
+                let actual_slot = place_imported_song(
+                    &mut placed_songs,
+                    &mut bank_data_usage,
+                    requested_slot,
+                    PlacedSong { stream },
+                    song_data_start,
+                    false,
+                    &input.display_name,
+                )?;
+                warnings.warn(format!(
+                    "auto-assigned {} to bank {:02} song {:02}",
+                    input.display_name,
+                    actual_slot.bank_index + 1,
+                    actual_slot.song_index + 1
+                ));
+                for warning in song_warnings.into_vec() {
+                    warnings.warn(format!(
+                        "bank {:02} song {:02}: {}",
+                        actual_slot.bank_index + 1,
+                        actual_slot.song_index + 1,
+                        warning
+                    ));
+                }
+            }
+            ImportedSongSource::Furnace { input } => {
+                let mut next_slot = find_auto_song_slot(
+                    &placed_songs,
+                    &mut bank_data_usage,
+                    first_auto_slot.clone(),
+                    0,
+                    song_data_start,
+                )?;
+                for (subsong_index, subsong) in input.module.subsongs.iter().enumerate() {
+                    let segments =
+                        build_voice_segments_from_intervals(&subsong.voices, &note_mapping);
+                    let stream = encode_voice_segments_to_stream(&segments);
+                    if global_fallback_stream.is_none() {
+                        global_fallback_stream = Some(stream.clone());
+                    }
+                    let requested_slot = if subsong_index == 0 {
+                        find_auto_song_slot(
+                            &placed_songs,
+                            &mut bank_data_usage,
+                            next_slot.clone(),
+                            stream.len(),
+                            song_data_start,
+                        )?
+                    } else {
+                        find_auto_song_slot(
+                            &placed_songs,
+                            &mut bank_data_usage,
+                            next_song_slot(&next_slot),
+                            stream.len(),
+                            song_data_start,
+                        )?
+                    };
+                    let actual_slot = place_imported_song(
+                        &mut placed_songs,
+                        &mut bank_data_usage,
+                        requested_slot,
+                        PlacedSong { stream },
+                        song_data_start,
+                        false,
+                        &subsong.display_name,
+                    )?;
+                    warnings.warn(format!(
+                        "auto-assigned {} to bank {:02} song {:02}",
+                        subsong.display_name,
+                        actual_slot.bank_index + 1,
+                        actual_slot.song_index + 1
+                    ));
                     next_slot = actual_slot;
                 }
             }
@@ -557,6 +651,47 @@ enum SongInputKind {
     Furnace,
 }
 
+fn parse_song_input_kind(name: &str) -> Option<SongInputKind> {
+    if name.ends_with(".mid") || name.ends_with(".MID") {
+        Some(SongInputKind::Midi)
+    } else if name.ends_with(".fur") || name.ends_with(".FUR") {
+        Some(SongInputKind::Furnace)
+    } else {
+        None
+    }
+}
+
+fn load_imported_song_source(
+    path: &Path,
+    kind: SongInputKind,
+    warnings: &mut WarningCollector,
+) -> Result<ImportedSongSource> {
+    match kind {
+        SongInputKind::Midi => {
+            let input = MidiImportInput {
+                display_name: path.display().to_string(),
+                bytes: fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+            };
+            Ok(ImportedSongSource::Midi { input })
+        }
+        SongInputKind::Furnace => {
+            let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let mut parse_warnings = WarningCollector::new();
+            let module =
+                parse_furnace_bytes(&path.display().to_string(), &bytes, &mut parse_warnings)
+                    .with_context(|| format!("decoding {}", path.display()))?;
+            for warning in parse_warnings.into_vec() {
+                warnings.warn(format!("{}: {}", path.display(), warning));
+            }
+            let input = FurnaceImportInput {
+                display_name: path.display().to_string(),
+                module,
+            };
+            Ok(ImportedSongSource::Furnace { input })
+        }
+    }
+}
+
 fn next_song_slot(current: &SongFileId) -> SongFileId {
     if current.song_index + 1 >= SONGS_PER_BANK {
         SongFileId {
@@ -568,6 +703,45 @@ fn next_song_slot(current: &SongFileId) -> SongFileId {
             bank_index: current.bank_index,
             song_index: current.song_index + 1,
         }
+    }
+}
+
+fn find_auto_song_slot(
+    placed_songs: &BTreeMap<usize, BTreeMap<usize, PlacedSong>>,
+    bank_data_usage: &mut Vec<usize>,
+    start_slot: SongFileId,
+    stream_len: usize,
+    song_data_start: usize,
+) -> Result<SongFileId> {
+    if song_data_start + stream_len > BANK_SIZE {
+        bail!(
+            "song needs {} bytes of song data but only {} bytes are available in an empty bank",
+            stream_len,
+            BANK_SIZE.saturating_sub(song_data_start)
+        );
+    }
+    let mut slot = start_slot;
+    loop {
+        ensure_bank_usage(bank_data_usage, slot.bank_index, song_data_start);
+        if bank_data_usage[slot.bank_index] + stream_len <= BANK_SIZE {
+            let start_song_index = slot.song_index;
+            for song_index in start_song_index..SONGS_PER_BANK {
+                if placed_songs
+                    .get(&slot.bank_index)
+                    .and_then(|songs| songs.get(&song_index))
+                    .is_none()
+                {
+                    return Ok(SongFileId {
+                        bank_index: slot.bank_index,
+                        song_index,
+                    });
+                }
+            }
+        }
+        slot = SongFileId {
+            bank_index: slot.bank_index + 1,
+            song_index: 0,
+        };
     }
 }
 
@@ -784,19 +958,12 @@ fn parse_pointer_table(bank: &[u8]) -> Result<Vec<u16>> {
 }
 
 fn parse_song_input_filename(name: &str) -> Option<(SongFileId, SongInputKind)> {
-    let (stem, kind) = if let Some(stem) = name
+    let kind = parse_song_input_kind(name)?;
+    let stem = name
         .strip_suffix(".mid")
         .or_else(|| name.strip_suffix(".MID"))
-    {
-        (stem, SongInputKind::Midi)
-    } else if let Some(stem) = name
-        .strip_suffix(".fur")
-        .or_else(|| name.strip_suffix(".FUR"))
-    {
-        (stem, SongInputKind::Furnace)
-    } else {
-        return None;
-    };
+        .or_else(|| name.strip_suffix(".fur"))
+        .or_else(|| name.strip_suffix(".FUR"))?;
     let (bank_part, song_part) = stem.split_once('_')?;
     let bank = bank_part
         .strip_prefix("bank")
@@ -1997,6 +2164,23 @@ mod tests {
         )
     }
 
+    fn firmware_song_voices(
+        firmware: &[u8],
+        bank_index: usize,
+        song_index: usize,
+    ) -> [Vec<HarmonySegment>; 3] {
+        let bank_start = bank_index * BANK_SIZE;
+        let bank = &firmware[bank_start..bank_start + BANK_SIZE];
+        let pointers = parse_pointer_table(bank).unwrap();
+        let start = usize::from(pointers[song_index]);
+        let end = bank[start..]
+            .iter()
+            .position(|&byte| byte == 0xFF)
+            .map(|offset| start + offset + 1)
+            .unwrap();
+        decode_stream_to_voice_segments(&bank[start..end]).unwrap()
+    }
+
     #[derive(Clone)]
     struct TestFurnaceSubsong {
         name: &'static str,
@@ -2206,6 +2390,201 @@ mod tests {
         out
     }
 
+    fn build_test_legacy_song_block(
+        total_channels: usize,
+        subsong: &TestFurnaceSubsong,
+    ) -> Vec<u8> {
+        let speed_a = subsong.speed_pattern.first().copied().unwrap_or(1);
+        let speed_b = subsong.speed_pattern.get(1).copied().unwrap_or(speed_a);
+        let mut body = Vec::new();
+        body.push(0);
+        body.push(speed_a as u8);
+        body.push(speed_b as u8);
+        body.push(1);
+        body.extend_from_slice(&subsong.ticks_per_second.to_le_bytes());
+        body.extend_from_slice(&subsong.pattern_length.to_le_bytes());
+        body.extend_from_slice(
+            &(subsong.orders.len() as u16 / total_channels as u16).to_le_bytes(),
+        );
+        body.push(4);
+        body.push(16);
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        push_c_string(&mut body, subsong.name);
+        push_c_string(&mut body, "");
+        body.extend_from_slice(&subsong.orders);
+        body.extend(std::iter::repeat_n(1u8, total_channels));
+        body.extend(std::iter::repeat_n(1u8, total_channels));
+        body.extend(std::iter::repeat_n(0u8, total_channels));
+        for _ in 0..total_channels {
+            push_c_string(&mut body, "");
+        }
+        for _ in 0..total_channels {
+            push_c_string(&mut body, "");
+        }
+        body.push(subsong.speed_pattern.len() as u8);
+        for index in 0..16 {
+            let speed = subsong.speed_pattern.get(index).copied().unwrap_or(1);
+            body.push(speed as u8);
+        }
+        build_test_block(b"SONG", body)
+    }
+
+    fn build_test_legacy_info_block(
+        chips: &[(u8, u16)],
+        first_subsong: &TestFurnaceSubsong,
+        pattern_count: usize,
+        pattern_pointers: &[u32],
+        extra_subsong_pointers: &[u32],
+    ) -> Vec<u8> {
+        let total_channels: usize = chips
+            .iter()
+            .map(|(_, channels)| usize::from(*channels))
+            .sum();
+        let speed_a = first_subsong.speed_pattern.first().copied().unwrap_or(1);
+        let speed_b = first_subsong
+            .speed_pattern
+            .get(1)
+            .copied()
+            .unwrap_or(speed_a);
+        let mut body = Vec::new();
+        body.push(0);
+        body.push(speed_a as u8);
+        body.push(speed_b as u8);
+        body.push(1);
+        body.extend_from_slice(&first_subsong.ticks_per_second.to_le_bytes());
+        body.extend_from_slice(&first_subsong.pattern_length.to_le_bytes());
+        body.extend_from_slice(
+            &(first_subsong.orders.len() as u16 / total_channels as u16).to_le_bytes(),
+        );
+        body.push(4);
+        body.push(16);
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&(pattern_count as u32).to_le_bytes());
+
+        for &(chip_id, _) in chips {
+            body.push(chip_id);
+        }
+        body.extend(std::iter::repeat_n(0u8, 32 - chips.len()));
+        body.extend(std::iter::repeat_n(0u8, 32));
+        body.extend(std::iter::repeat_n(0u8, 32));
+        body.extend(std::iter::repeat_n(0u8, 32 * 4));
+
+        push_c_string(&mut body, "song");
+        push_c_string(&mut body, "author");
+        body.extend_from_slice(&440.0f32.to_le_bytes());
+        body.extend(std::iter::repeat_n(0u8, 20));
+
+        for pointer in pattern_pointers {
+            body.extend_from_slice(&pointer.to_le_bytes());
+        }
+
+        body.extend_from_slice(&first_subsong.orders);
+        body.extend(std::iter::repeat_n(1u8, total_channels));
+        body.extend(std::iter::repeat_n(1u8, total_channels));
+        body.extend(std::iter::repeat_n(0u8, total_channels));
+        for _ in 0..total_channels {
+            push_c_string(&mut body, "");
+        }
+        for _ in 0..total_channels {
+            push_c_string(&mut body, "");
+        }
+        push_c_string(&mut body, "");
+        body.extend_from_slice(&1.0f32.to_le_bytes());
+        body.extend(std::iter::repeat_n(0u8, 28));
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        push_c_string(&mut body, first_subsong.name);
+        push_c_string(&mut body, "");
+        body.push(extra_subsong_pointers.len() as u8);
+        body.extend_from_slice(&[0u8; 3]);
+        for pointer in extra_subsong_pointers {
+            body.extend_from_slice(&pointer.to_le_bytes());
+        }
+
+        for value in ["system", "category", "", "", "", ""] {
+            push_c_string(&mut body, value);
+        }
+        for _ in chips {
+            body.extend_from_slice(&1.0f32.to_le_bytes());
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+            body.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(1);
+        body.extend(std::iter::repeat_n(0u8, 8));
+        body.push(first_subsong.speed_pattern.len() as u8);
+        for index in 0..16 {
+            let speed = first_subsong.speed_pattern.get(index).copied().unwrap_or(1);
+            body.push(speed as u8);
+        }
+        body.push(0);
+        body.extend_from_slice(&[0u8; 12]);
+
+        build_test_block(b"INFO", body)
+    }
+
+    fn build_test_legacy_furnace_module(
+        version: u16,
+        chips: &[(u8, u16)],
+        subsongs: &[TestFurnaceSubsong],
+        patterns: &[TestFurnacePattern],
+    ) -> Vec<u8> {
+        assert!(!subsongs.is_empty());
+        let total_channels: usize = chips
+            .iter()
+            .map(|(_, channels)| usize::from(*channels))
+            .sum();
+        let extra_subsong_blocks: Vec<Vec<u8>> = subsongs[1..]
+            .iter()
+            .map(|subsong| build_test_legacy_song_block(total_channels, subsong))
+            .collect();
+        let pattern_blocks: Vec<Vec<u8>> = patterns.iter().map(build_test_pattern_block).collect();
+
+        let placeholder_info = build_test_legacy_info_block(
+            chips,
+            &subsongs[0],
+            pattern_blocks.len(),
+            &vec![0; pattern_blocks.len()],
+            &vec![0; extra_subsong_blocks.len()],
+        );
+        let mut next_ptr = 32 + placeholder_info.len();
+        let mut extra_subsong_pointers = Vec::with_capacity(extra_subsong_blocks.len());
+        for block in &extra_subsong_blocks {
+            extra_subsong_pointers.push(next_ptr as u32);
+            next_ptr += block.len();
+        }
+        let mut pattern_pointers = Vec::with_capacity(pattern_blocks.len());
+        for block in &pattern_blocks {
+            pattern_pointers.push(next_ptr as u32);
+            next_ptr += block.len();
+        }
+
+        let info_block = build_test_legacy_info_block(
+            chips,
+            &subsongs[0],
+            pattern_blocks.len(),
+            &pattern_pointers,
+            &extra_subsong_pointers,
+        );
+        let mut out = Vec::new();
+        out.extend_from_slice(b"-Furnace module-");
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&32u32.to_le_bytes());
+        out.extend_from_slice(&[0u8; 8]);
+        out.extend_from_slice(&info_block);
+        for block in extra_subsong_blocks {
+            out.extend_from_slice(&block);
+        }
+        for block in pattern_blocks {
+            out.extend_from_slice(&block);
+        }
+        out
+    }
+
     fn compress_zlib(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).unwrap();
@@ -2286,37 +2665,73 @@ mod tests {
                 subsong: 0,
                 channel: 0,
                 index: 0,
-                rows: vec![(0, TestFurnaceRow { note: Some(108), ..Default::default() })],
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(108),
+                        ..Default::default()
+                    },
+                )],
             },
             TestFurnacePattern {
                 subsong: 0,
                 channel: 0,
                 index: 1,
-                rows: vec![(0, TestFurnaceRow { note: Some(109), ..Default::default() })],
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(109),
+                        ..Default::default()
+                    },
+                )],
             },
             TestFurnacePattern {
                 subsong: 0,
                 channel: 1,
                 index: 2,
-                rows: vec![(0, TestFurnaceRow { note: Some(110), ..Default::default() })],
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(110),
+                        ..Default::default()
+                    },
+                )],
             },
             TestFurnacePattern {
                 subsong: 0,
                 channel: 1,
                 index: 3,
-                rows: vec![(0, TestFurnaceRow { note: Some(111), ..Default::default() })],
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(111),
+                        ..Default::default()
+                    },
+                )],
             },
             TestFurnacePattern {
                 subsong: 0,
                 channel: 2,
                 index: 4,
-                rows: vec![(0, TestFurnaceRow { note: Some(112), ..Default::default() })],
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(112),
+                        ..Default::default()
+                    },
+                )],
             },
             TestFurnacePattern {
                 subsong: 0,
                 channel: 2,
                 index: 5,
-                rows: vec![(0, TestFurnaceRow { note: Some(113), ..Default::default() })],
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(113),
+                        ..Default::default()
+                    },
+                )],
             },
         ];
         let module = build_test_furnace_module(&[(0x80, 3)], &[subsong], &patterns);
@@ -2900,6 +3315,215 @@ mod tests {
     }
 
     #[test]
+    fn furnace_parser_accepts_legacy_zlib_and_maps_ay_offset() {
+        let (subsong, patterns) = simple_ay_furnace_subsong("legacy-offset", 7, 4, 108, 112, 115);
+        let module =
+            build_test_legacy_furnace_module(157, &[(0x03, 4), (0x80, 3)], &[subsong], &patterns);
+        let compressed = compress_zlib(&module);
+
+        let parsed_raw =
+            parse_furnace_bytes("legacy-offset.fur", &module, &mut WarningCollector::new())
+                .unwrap();
+        let parsed_zlib = parse_furnace_bytes(
+            "legacy-offset.fur",
+            &compressed,
+            &mut WarningCollector::new(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed_raw.subsongs.len(), 1);
+        assert_eq!(parsed_zlib.subsongs.len(), 1);
+        assert_eq!(parsed_raw.subsongs[0].voices[0][0].pitch_value, 60.0);
+        assert_eq!(parsed_raw.subsongs[0].voices[1][0].pitch_value, 64.0);
+        assert_eq!(parsed_raw.subsongs[0].voices[2][0].pitch_value, 67.0);
+        assert_eq!(parsed_zlib.pitch_bounds, Some((60.0, 67.0)));
+    }
+
+    #[test]
+    fn furnace_parser_reads_legacy_info_and_song_subsongs() {
+        let (subsong_a, mut patterns_a) = simple_ay_furnace_subsong("first", 3, 0, 108, 112, 115);
+        let (subsong_b, mut patterns_b) = simple_ay_furnace_subsong("second", 3, 0, 109, 113, 116);
+        for pattern in &mut patterns_b {
+            pattern.subsong = 1;
+        }
+        patterns_a.append(&mut patterns_b);
+
+        let parsed = parse_furnace_bytes(
+            "legacy-subsongs.fur",
+            &build_test_legacy_furnace_module(
+                157,
+                &[(0x80, 3)],
+                &[subsong_a, subsong_b],
+                &patterns_a,
+            ),
+            &mut WarningCollector::new(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.subsongs.len(), 2);
+        assert_eq!(
+            parsed.subsongs[0].display_name,
+            "legacy-subsongs.fur subsong 0 (first)"
+        );
+        assert_eq!(
+            parsed.subsongs[1].display_name,
+            "legacy-subsongs.fur subsong 1 (second)"
+        );
+        assert_eq!(parsed.subsongs[0].voices[0][0].pitch_value, 60.0);
+        assert_eq!(parsed.subsongs[1].voices[0][0].pitch_value, 61.0);
+        assert_eq!(parsed.pitch_bounds, Some((60.0, 68.0)));
+    }
+
+    #[test]
+    fn furnace_parser_truncates_backward_loop_jumps_with_warning() {
+        let subsong = TestFurnaceSubsong {
+            name: "loop",
+            ticks_per_second: 64.0,
+            speed_pattern: vec![1],
+            pattern_length: 64,
+            orders: vec![0, 0, 0],
+        };
+        let patterns = vec![
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 0,
+                index: 0,
+                rows: vec![
+                    (
+                        0,
+                        TestFurnaceRow {
+                            note: Some(108),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        48,
+                        TestFurnaceRow {
+                            effect0: Some((0x0B, 0x00)),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 1,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(112),
+                        ..Default::default()
+                    },
+                )],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 2,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(115),
+                        ..Default::default()
+                    },
+                )],
+            },
+        ];
+
+        let mut warnings = WarningCollector::new();
+        let parsed = parse_furnace_bytes(
+            "loop.fur",
+            &build_test_legacy_furnace_module(157, &[(0x80, 3)], &[subsong], &patterns),
+            &mut warnings,
+        )
+        .unwrap();
+        let warnings = warnings.into_vec();
+
+        assert_eq!(parsed.subsongs[0].voices[0][0].start, 0);
+        assert_eq!(parsed.subsongs[0].voices[0][0].end, 49);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("truncated after the first pass"))
+        );
+    }
+
+    #[test]
+    fn furnace_parser_ignores_zero_arp_effect() {
+        let subsong = TestFurnaceSubsong {
+            name: "arp0",
+            ticks_per_second: 64.0,
+            speed_pattern: vec![1],
+            pattern_length: 2,
+            orders: vec![0, 0, 0],
+        };
+        let patterns = vec![
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 0,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(108),
+                        effect0: Some((0x00, 0x00)),
+                        ..Default::default()
+                    },
+                )],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 1,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(112),
+                        ..Default::default()
+                    },
+                )],
+            },
+            TestFurnacePattern {
+                subsong: 0,
+                channel: 2,
+                index: 0,
+                rows: vec![(
+                    0,
+                    TestFurnaceRow {
+                        note: Some(115),
+                        ..Default::default()
+                    },
+                )],
+            },
+        ];
+
+        let parsed = parse_furnace_bytes(
+            "arp0.fur",
+            &build_test_legacy_furnace_module(157, &[(0x80, 3)], &[subsong], &patterns),
+            &mut WarningCollector::new(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.subsongs[0].voices[0][0].pitch_value, 60.0);
+    }
+
+    #[test]
+    fn furnace_parser_rejects_pre_patn_legacy_versions() {
+        let (subsong, patterns) = simple_ay_furnace_subsong("old", 3, 0, 108, 112, 115);
+        let mut module = build_test_legacy_furnace_module(157, &[(0x80, 3)], &[subsong], &patterns);
+        module[16] = 156;
+        module[17] = 0;
+
+        let error =
+            parse_furnace_bytes("old.fur", &module, &mut WarningCollector::new()).unwrap_err();
+        assert!(
+            error.to_string().contains("version 156"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn build_firmware_accepts_mixed_mid_and_fur_inputs() {
         let input_dir = temp_test_dir("mixed-build-input");
         let output_path = temp_test_dir("mixed-build-output").with_extension("bin");
@@ -2925,6 +3549,173 @@ mod tests {
 
         let _ = fs::remove_dir_all(&input_dir);
         let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn build_firmware_auto_assigns_arbitrary_mid_files_in_lexicographic_gap_order() {
+        let input_dir = temp_test_dir("auto-mid-gap-input");
+        let output_path = temp_test_dir("auto-mid-gap-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+        fs::write(
+            input_dir.join("bank01_song02.mid"),
+            single_note_midi_bytes(62, 8, HARMONY_TICKS_PER_QUARTER),
+        )
+        .unwrap();
+        fs::write(
+            input_dir.join("alpha.mid"),
+            single_note_midi_bytes(60, 8, HARMONY_TICKS_PER_QUARTER),
+        )
+        .unwrap();
+        fs::write(
+            input_dir.join("zeta.mid"),
+            single_note_midi_bytes(64, 8, HARMONY_TICKS_PER_QUARTER),
+        )
+        .unwrap();
+
+        let report = build_firmware_from_dir(&input_dir, &output_path).unwrap();
+        assert_eq!(report.banks.len(), 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("alpha.mid to bank 01 song 01"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("zeta.mid to bank 01 song 03"))
+        );
+
+        let firmware = fs::read(&output_path).unwrap();
+        let song1 = firmware_song_voices(&firmware, 0, 0);
+        let song2 = firmware_song_voices(&firmware, 0, 1);
+        let song3 = firmware_song_voices(&firmware, 0, 2);
+        assert!(song1[0][0].voiced);
+        assert!(song2[0][0].voiced);
+        assert!(song3[0][0].voiced);
+        assert_ne!(song1[0][0].idx, song2[0][0].idx);
+        assert_ne!(song2[0][0].idx, song3[0][0].idx);
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn build_firmware_auto_assigns_mixed_arbitrary_mid_and_fur_inputs() {
+        let input_dir = temp_test_dir("auto-mixed-input");
+        let output_path = temp_test_dir("auto-mixed-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+
+        let (subsong, patterns) = simple_ay_furnace_subsong("alpha", 3, 0, 108, 112, 115);
+        let fur = build_test_furnace_module(&[(0x80, 3)], &[subsong], &patterns);
+        fs::write(input_dir.join("alpha.fur"), fur).unwrap();
+        fs::write(
+            input_dir.join("beta.mid"),
+            single_note_midi_bytes(65, 8, HARMONY_TICKS_PER_QUARTER),
+        )
+        .unwrap();
+
+        let report = build_firmware_from_dir(&input_dir, &output_path).unwrap();
+        assert_eq!(report.banks.len(), 1);
+        assert_eq!(report.banks[0].unique_song_count, 2);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("alpha.fur subsong 0 (alpha) to bank 01 song 01"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("beta.mid to bank 01 song 02"))
+        );
+
+        let firmware = fs::read(&output_path).unwrap();
+        let song1 = firmware_song_voices(&firmware, 0, 0);
+        let song2 = firmware_song_voices(&firmware, 0, 1);
+        assert_ne!(song1[0][0].idx, song2[0][0].idx);
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn build_firmware_auto_assigns_arbitrary_fur_subsongs_across_free_slots() {
+        let input_dir = temp_test_dir("auto-fur-gap-input");
+        let output_path = temp_test_dir("auto-fur-gap-output").with_extension("bin");
+        fs::create_dir_all(&input_dir).unwrap();
+        fs::write(input_dir.join("code.bin"), sample_code()).unwrap();
+        fs::write(
+            input_dir.join("bank01_song02.mid"),
+            single_note_midi_bytes(65, 8, HARMONY_TICKS_PER_QUARTER),
+        )
+        .unwrap();
+
+        let (subsong_a, mut patterns_a) = simple_ay_furnace_subsong("first", 3, 0, 108, 112, 115);
+        let (subsong_b, mut patterns_b) = simple_ay_furnace_subsong("second", 3, 0, 109, 113, 116);
+        for pattern in &mut patterns_b {
+            pattern.subsong = 1;
+        }
+        patterns_a.append(&mut patterns_b);
+        let fur = build_test_furnace_module(&[(0x80, 3)], &[subsong_a, subsong_b], &patterns_a);
+        fs::write(input_dir.join("set.fur"), fur).unwrap();
+
+        let report = build_firmware_from_dir(&input_dir, &output_path).unwrap();
+        assert_eq!(report.banks.len(), 1);
+        assert_eq!(report.banks[0].unique_song_count, 3);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("set.fur subsong 0 (first) to bank 01 song 01"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("set.fur subsong 1 (second) to bank 01 song 03"))
+        );
+
+        let firmware = fs::read(&output_path).unwrap();
+        let song1 = firmware_song_voices(&firmware, 0, 0);
+        let song2 = firmware_song_voices(&firmware, 0, 1);
+        let song3 = firmware_song_voices(&firmware, 0, 2);
+        assert_ne!(song1[0][0].idx, song2[0][0].idx);
+        assert_ne!(song2[0][0].idx, song3[0][0].idx);
+
+        let _ = fs::remove_dir_all(&input_dir);
+        let _ = fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn auto_slot_allocator_skips_banks_without_enough_song_bytes() {
+        let mut placed_songs = BTreeMap::new();
+        placed_songs.insert(0, BTreeMap::from([(0, PlacedSong { stream: vec![0xFF] })]));
+        let mut bank_data_usage = vec![BANK_SIZE - 4];
+
+        let slot = find_auto_song_slot(
+            &placed_songs,
+            &mut bank_data_usage,
+            SongFileId {
+                bank_index: 0,
+                song_index: 1,
+            },
+            8,
+            DEFAULT_CODE_SECTION_LEN,
+        )
+        .unwrap();
+
+        assert_eq!(
+            slot,
+            SongFileId {
+                bank_index: 1,
+                song_index: 0
+            }
+        );
     }
 
     #[test]

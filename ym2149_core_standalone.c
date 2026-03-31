@@ -40,6 +40,10 @@ enum {
     AY_PORTA = 0x0E
 };
 
+static uint8_t ym2149_normalize_backend(uint8_t backend) {
+    return (backend == YM2149_BACKEND_FURNACE) ? YM2149_BACKEND_FURNACE : YM2149_BACKEND_MAME;
+}
+
 static const AYParam ym2149_param = {
     630, 801, 16,
     {73770, 37586, 27458, 21451, 15864, 12371, 8922, 6796,
@@ -134,6 +138,10 @@ static void ym2149_seed_resampler(YM2149Core *ym) {
     ym->resample_seeded = 1;
 }
 
+const char *ym2149_backend_name(uint8_t backend) {
+    return ym2149_normalize_backend(backend) == YM2149_BACKEND_FURNACE ? "furnace" : "mame";
+}
+
 static void ym2149_write_reg(YM2149Core *ym, int reg, uint8_t value) {
     uint8_t coarse;
 
@@ -156,17 +164,13 @@ static void ym2149_write_reg(YM2149Core *ym, int reg, uint8_t value) {
         ym->tone[2].period = (uint32_t)ym->regs[AY_CFINE] | ((uint32_t)coarse << 8);
         break;
     case AY_AVOL:
-        /* Harmony32 firmware appears to use software decay only; clamp to fixed 4-bit volume. */
-        ym->tone[0].volume = (uint8_t)(ym->regs[AY_AVOL] & 0x0F);
-        ym->regs[AY_AVOL] = ym->tone[0].volume;
+        ym->tone[0].volume = ym->regs[AY_AVOL];
         break;
     case AY_BVOL:
-        ym->tone[1].volume = (uint8_t)(ym->regs[AY_BVOL] & 0x0F);
-        ym->regs[AY_BVOL] = ym->tone[1].volume;
+        ym->tone[1].volume = ym->regs[AY_BVOL];
         break;
     case AY_CVOL:
-        ym->tone[2].volume = (uint8_t)(ym->regs[AY_CVOL] & 0x0F);
-        ym->regs[AY_CVOL] = ym->tone[2].volume;
+        ym->tone[2].volume = ym->regs[AY_CVOL];
         break;
     case AY_EAFINE:
     case AY_EACOARSE:
@@ -181,11 +185,16 @@ static void ym2149_write_reg(YM2149Core *ym, int reg, uint8_t value) {
 }
 
 void ym2149_init(YM2149Core *ym, uint32_t clock_hz, uint32_t sample_rate) {
+    ym2149_init_backend(ym, clock_hz, sample_rate, YM2149_BACKEND_MAME);
+}
+
+void ym2149_init_backend(YM2149Core *ym, uint32_t clock_hz, uint32_t sample_rate, uint8_t backend) {
     memset(ym, 0, sizeof(*ym));
 
     ym->chip_clock_hz = clock_hz;
     ym->output_sample_rate = sample_rate;
     ym->chip_sample_rate = (clock_hz > 7) ? (clock_hz / 8u) : 1u;
+    ym->backend_kind = ym2149_normalize_backend(backend);
     ym->render_mode = YM2149_RENDER_RESAMPLED;
 
     build_single_table(1000.0, &ym2149_param, 1, ym->vol_table, 0);
@@ -201,6 +210,15 @@ void ym2149_set_clock(YM2149Core *ym, uint32_t clock_hz) {
 
     ym->chip_clock_hz = clock_hz;
     ym->chip_sample_rate = (clock_hz > 7) ? (clock_hz / 8u) : 1u;
+}
+
+void ym2149_set_backend(YM2149Core *ym, uint8_t backend) {
+    if (!ym) {
+        return;
+    }
+
+    ym->backend_kind = ym2149_normalize_backend(backend);
+    ym2149_reset(ym);
 }
 
 void ym2149_set_render_mode(YM2149Core *ym, uint8_t mode) {
@@ -269,11 +287,18 @@ static double ym2149_step_chip_sample(YM2149Core *ym, double out_channels[3]) {
         }
     }
 
-    if ((++ym->count_noise) >= (int16_t)(ym->regs[AY_NOISEPER] & 0x1F)) {
-        ym->count_noise = 0;
-        ym->prescale_noise ^= 1u;
-        if (!ym->prescale_noise) {
-            ym->rng = (ym->rng >> 1) | ((uint32_t)(BIT(ym->rng, 0) ^ BIT(ym->rng, 3)) << 16);
+    {
+        uint8_t period_noise = (uint8_t)(ym->regs[AY_NOISEPER] & 0x1F);
+        if (ym->backend_kind == YM2149_BACKEND_FURNACE && period_noise == 0) {
+            period_noise = 1;
+        }
+
+        if ((++ym->count_noise) >= (int16_t)period_noise) {
+            ym->count_noise = 0;
+            ym->prescale_noise ^= 1u;
+            if (!ym->prescale_noise) {
+                ym->rng = (ym->rng >> 1) | ((uint32_t)(BIT(ym->rng, 0) ^ BIT(ym->rng, 3)) << 16);
+            }
         }
     }
 

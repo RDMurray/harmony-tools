@@ -23,7 +23,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
     this.stemPtr = 0;
     this.outFrames = 128;
     this.statusPtr = 0;
-    this.statusStride = 32;
+    this.statusStride = 36;
     this.statusTicker = 0;
     this.satLastIn = [0.0, 0.0, 0.0];
     this.satLastOut = [0.0, 0.0, 0.0];
@@ -123,6 +123,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
     let cpuHz = this.cpuHz;
     let ymHz = this.ymHz;
     let ymRenderMode = 1;
+    let ymBackend = 0;
 
     if (this.ctrl) {
       song = Atomics.load(this.ctrl, 1);
@@ -142,6 +143,7 @@ class Harmony32Processor extends AudioWorkletProcessor {
         ymHz = Atomics.load(this.ctrlU32, 17) >>> 0;
       }
       ymRenderMode = Atomics.load(this.ctrl, 18);
+      ymBackend = Atomics.load(this.ctrl, 19);
       if (!forceReset) {
         Atomics.store(this.ctrl, 0, 0);
       }
@@ -159,9 +161,13 @@ class Harmony32Processor extends AudioWorkletProcessor {
     if (ymRenderMode !== 0) {
       ymRenderMode = 1;
     }
+    if (ymBackend !== 1) {
+      ymBackend = 0;
+    }
     this.cpuHz = cpuHz;
     this.ymHz = ymHz;
 
+    this.mod._h32_set_ym_backend(this.engine, ymBackend);
     if (forceReset) {
       this.mod._h32_reset_full(this.engine, song, bank >>> 0);
     }
@@ -238,7 +244,8 @@ class Harmony32Processor extends AudioWorkletProcessor {
       sampleRate: u32[baseU32 + 4],
       cpuHz: u32[baseU32 + 5],
       ymHz: u32[baseU32 + 6],
-      steps: u32[baseU32 + 7]
+      steps: u32[baseU32 + 7],
+      ymBackend: u32[baseU32 + 8]
     };
 
     this.port.postMessage({ type: "status", status });

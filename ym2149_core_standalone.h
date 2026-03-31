@@ -48,9 +48,10 @@ typedef struct {
     uint32_t chip_clock_hz;
     uint32_t output_sample_rate;
     uint32_t chip_sample_rate;
+    uint8_t backend_kind;
     uint8_t render_mode;
     uint8_t resample_seeded;
-    uint16_t reserved0;
+    uint8_t reserved0;
     uint64_t step_accum;
     double resample_phase;
     double resample_prev_channels[3];
@@ -61,20 +62,29 @@ typedef struct {
 } YM2149Core;
 
 enum {
+    YM2149_BACKEND_MAME = 0,
+    YM2149_BACKEND_FURNACE = 1
+};
+
+enum {
     YM2149_RENDER_DIRECT = 0,
     YM2149_RENDER_RESAMPLED = 1
 };
 
 void ym2149_init(YM2149Core *ym, uint32_t clock_hz, uint32_t sample_rate);
+void ym2149_init_backend(YM2149Core *ym, uint32_t clock_hz, uint32_t sample_rate, uint8_t backend);
 void ym2149_set_clock(YM2149Core *ym, uint32_t clock_hz);
+void ym2149_set_backend(YM2149Core *ym, uint8_t backend);
 void ym2149_set_render_mode(YM2149Core *ym, uint8_t mode);
 void ym2149_reset(YM2149Core *ym);
 void ym2149_write_address(YM2149Core *ym, uint8_t reg);
 void ym2149_write_data(YM2149Core *ym, uint8_t value);
 double ym2149_next_sample(YM2149Core *ym);
 double ym2149_next_sample_channels(YM2149Core *ym, double out_channels[3]);
+const char *ym2149_backend_name(uint8_t backend);
 
 static inline const uint8_t *ym2149_regs(const YM2149Core *ym) { return ym->regs; }
 static inline uint8_t ym2149_selected_reg(const YM2149Core *ym) { return ym->selected_reg; }
+static inline uint8_t ym2149_backend(const YM2149Core *ym) { return ym->backend_kind; }
 
 #endif

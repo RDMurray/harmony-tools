@@ -31,34 +31,109 @@ struct H32Engine {
     uint32_t sample_rate;
     uint32_t cpu_hz;
     uint32_t steps;
+    uint8_t ym_backend;
+    uint8_t suppress_psg_writes;
+    uint8_t tick_trace_valid;
 
     double sample_cursor;
+    double tick_sample_position;
     double channel_level[3];
     double channel_pan[3];
+    H32StepTrace tick_trace;
+    uint32_t tick_write_index;
 };
 
 static int h32_reinitialize_song(H32Engine *e);
 
-static int h32_advance_to_sample(H32Engine *engine) {
-    while (engine->sample_cursor <= 0.0) {
-        uint32_t tstates = 0;
-        int alive = h32_board_step_music_tick(&engine->board, &tstates);
+static double h32_tstates_to_samples(const H32Engine *engine, uint32_t tstates) {
+    return ((double)tstates * (double)engine->sample_rate) / (double)engine->cpu_hz;
+}
 
-        if (alive <= 0) {
-            engine->song_ended = 1;
-            if (h32_reinitialize_song(engine) != 0) {
-                return -1;
-            }
-            continue;
-        }
-
-        engine->steps++;
-        if (tstates == 0) {
-            tstates = 1;
-        }
-        engine->sample_cursor += ((double)tstates * (double)engine->sample_rate) / (double)engine->cpu_hz;
+static void h32_apply_psg_write(H32Engine *engine, uint8_t port, uint8_t value) {
+    if (port == 0x03) {
+        ym2149_write_address(&engine->ym, value);
+        return;
     }
-    return 0;
+    if (port == 0x02) {
+        ym2149_write_data(&engine->ym, value);
+    }
+}
+
+static void h32_reset_tick_scheduler(H32Engine *engine) {
+    engine->sample_cursor = 0.0;
+    engine->tick_sample_position = 0.0;
+    engine->tick_trace_valid = 0;
+    engine->tick_write_index = 0;
+    memset(&engine->tick_trace, 0, sizeof(engine->tick_trace));
+}
+
+static void h32_apply_tick_writes(H32Engine *engine) {
+    if (!engine->tick_trace_valid) {
+        return;
+    }
+
+    while (engine->tick_write_index < engine->tick_trace.write_count) {
+        const H32PortWrite *write = &engine->tick_trace.writes[engine->tick_write_index];
+        double write_offset = h32_tstates_to_samples(engine, write->tstate_end);
+        if (write_offset > engine->tick_sample_position) {
+            break;
+        }
+        h32_apply_psg_write(engine, write->port, write->value);
+        engine->tick_write_index++;
+    }
+}
+
+static void h32_apply_trace_all(H32Engine *engine, const H32StepTrace *trace) {
+    uint32_t i;
+    for (i = 0; i < trace->write_count; i++) {
+        h32_apply_psg_write(engine, trace->writes[i].port, trace->writes[i].value);
+    }
+}
+
+static int h32_advance_to_sample(H32Engine *engine) {
+    for (;;) {
+        h32_apply_tick_writes(engine);
+        if (engine->sample_cursor > 0.0) {
+            return 0;
+        }
+        {
+            H32StepTrace trace;
+            double tick_samples;
+            int alive;
+
+            engine->suppress_psg_writes = 1;
+            alive = h32_board_step_music_tick_trace(&engine->board, &trace);
+            engine->suppress_psg_writes = 0;
+
+            if (alive <= 0) {
+                engine->song_ended = 1;
+                if (h32_reinitialize_song(engine) != 0) {
+                    return -1;
+                }
+                continue;
+            }
+
+            engine->steps++;
+            if (trace.total_tstates == 0) {
+                trace.total_tstates = 1;
+            }
+            tick_samples = h32_tstates_to_samples(engine, trace.total_tstates);
+            engine->sample_cursor += tick_samples;
+            if (engine->sample_cursor <= 0.0) {
+                h32_apply_trace_all(engine, &trace);
+                engine->tick_trace_valid = 0;
+                continue;
+            }
+
+            engine->tick_trace = trace;
+            engine->tick_trace_valid = 1;
+            engine->tick_write_index = 0;
+            engine->tick_sample_position = tick_samples - engine->sample_cursor;
+            if (engine->tick_sample_position < 0.0) {
+                engine->tick_sample_position = 0.0;
+            }
+        }
+    }
 }
 
 static uint8_t h32_in_port(void *user, uint8_t port) {
@@ -71,13 +146,10 @@ static uint8_t h32_in_port(void *user, uint8_t port) {
 
 static void h32_out_port(void *user, uint8_t port, uint8_t value) {
     H32Engine *e = (H32Engine *)user;
-    if (port == 0x03) {
-        ym2149_write_address(&e->ym, value);
+    if (e->suppress_psg_writes) {
         return;
     }
-    if (port == 0x02) {
-        ym2149_write_data(&e->ym, value);
-    }
+    h32_apply_psg_write(e, port, value);
 }
 
 static void h32_update_input_port(H32Engine *e) {
@@ -87,7 +159,7 @@ static void h32_update_input_port(H32Engine *e) {
 static int h32_reinitialize_song(H32Engine *e) {
     uint32_t bank_count;
     ym2149_reset(&e->ym);
-    e->sample_cursor = 0.0;
+    h32_reset_tick_scheduler(e);
     e->song_ended = 0;
 
     h32_update_input_port(e);
@@ -136,6 +208,7 @@ H32_KEEPALIVE H32Engine *h32_create(uint32_t sample_rate, uint32_t cpu_hz) {
     e->drums_on = 1;
     e->running = 1;
     e->mix_mode = 1;
+    e->ym_backend = H32_YM_BACKEND_MAME;
     e->channel_level[0] = 1.0;
     e->channel_level[1] = 1.0;
     e->channel_level[2] = 1.0;
@@ -143,7 +216,7 @@ H32_KEEPALIVE H32Engine *h32_create(uint32_t sample_rate, uint32_t cpu_hz) {
     e->channel_pan[1] = 0.0;
     e->channel_pan[2] = 0.0;
 
-    ym2149_init(&e->ym, 2000000u, sample_rate);
+    ym2149_init_backend(&e->ym, 2000000u, sample_rate, e->ym_backend);
 
     h32_board_init(&e->board, h32_in_port, h32_out_port, e);
     h32_update_input_port(e);
@@ -223,6 +296,7 @@ H32_KEEPALIVE int h32_set_cpu_hz(H32Engine *engine, uint32_t cpu_hz) {
     ratio = (double)engine->cpu_hz / (double)cpu_hz;
     engine->cpu_hz = cpu_hz;
     engine->sample_cursor *= ratio;
+    engine->tick_sample_position *= ratio;
     return 0;
 }
 
@@ -237,6 +311,25 @@ H32_KEEPALIVE int h32_set_ym_hz(H32Engine *engine, uint32_t ym_hz) {
 
     ym2149_set_clock(&engine->ym, ym_hz);
     return 0;
+}
+
+H32_KEEPALIVE int h32_set_ym_backend(H32Engine *engine, uint8_t backend) {
+    if (!engine || backend > H32_YM_BACKEND_FURNACE) {
+        return -1;
+    }
+
+    if (engine->ym_backend == backend) {
+        return 0;
+    }
+
+    engine->ym_backend = backend;
+    ym2149_set_backend(&engine->ym, backend);
+
+    if (h32_board_bank_count(&engine->board) == 0) {
+        return 0;
+    }
+
+    return h32_reinitialize_song(engine);
 }
 
 H32_KEEPALIVE int h32_set_ym_render_mode(H32Engine *engine, uint8_t render_mode) {
@@ -288,6 +381,7 @@ H32_KEEPALIVE int h32_reset_cpu(H32Engine *engine) {
     if (h32_board_reset_cpu(&engine->board) != 0) {
         return -1;
     }
+    h32_reset_tick_scheduler(engine);
     engine->song_ended = 0;
     engine->initialized = 1;
     return 0;
@@ -358,6 +452,7 @@ H32_KEEPALIVE uint32_t h32_render(H32Engine *engine, float *out, uint32_t frames
             out[o + 1u] = (float)right;
             produced++;
             engine->sample_cursor -= 1.0;
+            engine->tick_sample_position += 1.0;
         }
     }
 
@@ -397,6 +492,7 @@ H32_KEEPALIVE uint32_t h32_render_stems(H32Engine *engine, float *out, uint32_t 
         out[o + 2u] = (float)ch[2];
         produced++;
         engine->sample_cursor -= 1.0;
+        engine->tick_sample_position += 1.0;
     }
 
     return produced;
@@ -422,6 +518,7 @@ H32_KEEPALIVE int h32_get_status(const H32Engine *engine, H32Status *out_status)
     out_status->cpu_hz = engine->cpu_hz;
     out_status->ym_hz = engine->ym.chip_clock_hz;
     out_status->steps = engine->steps;
+    out_status->ym_backend = engine->ym_backend;
 
     return 0;
 }

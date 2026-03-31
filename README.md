@@ -33,7 +33,7 @@ harmony-midi to-harmony extracted/code.bin song01.mid song01.bin
 harmony-midi build extracted/ rebuilt.bin
 ```
 
-`build` accepts mixed `bankNN_songNN.mid` and `bankNN_songNN.fur` inputs in the same directory. A `.fur` file expands one subsong per Harmony slot, starting at the filename's bank/song and carrying into later slots and banks as needed.
+`build` accepts mixed `bankNN_songNN.mid` and `bankNN_songNN.fur` inputs in the same directory, plus arbitrary top-level `.mid` / `.fur` filenames. Explicit `bankNN_songNN` files reserve their slots first; remaining arbitrary-name files are then assigned automatically into the lowest free bank/song slots in lexicographic filename order. A `.fur` file expands one subsong per Harmony slot, starting at the filename's bank/song when explicitly named, or at the next automatic free slot when not, and carries into later slots and banks as needed.
 
 For full command help:
 
